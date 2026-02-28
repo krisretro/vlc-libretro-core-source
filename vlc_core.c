@@ -117,6 +117,10 @@ vlc_audio_flush();                     // ← stronger flush
 
     libvlc_media_t *m = NULL;
     bool is_online = strstr(path, "://") != NULL;
+	    // More robust online detection for m3u entries
+    if (!is_online) {
+        is_online = (strstr(path, "http://") || strstr(path, "https://"));
+    }
     bool is_dvd = false;
     bool is_bluray = false;
 
@@ -145,7 +149,7 @@ vlc_audio_flush();                     // ← stronger flush
         }
     }
 
-    // Media type override
+// Media type override
     var.key = "vlc_media_type";
     const char *media_type = "auto";
     if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value) {
@@ -160,6 +164,17 @@ vlc_audio_flush();                     // ← stronger flush
     } else if (strcmp(media_type, "file") == 0) {
         is_dvd = false;
         is_bluray = false;
+    }
+bool ctts_fix_enabled = false;
+var.key = "vlc_ctts_fix";
+if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value) {
+    ctts_fix_enabled = (strcmp(var.value, "enabled") == 0);
+}
+    // === SAFETY FIX FOR ONLINE URLS ===   <--- ADD THIS BLOCK HERE
+    if (is_online) {
+        is_dvd = false;
+        is_bluray = false;
+        fprintf(stderr, "[VLC] Online URL detected → forcing normal file mode (DVD/Blu-ray option ignored)\n");
     }
 
     // --- Create media based on type ---
@@ -219,12 +234,33 @@ vlc_audio_flush();                     // ← stronger flush
             fprintf(stderr, "[VLC] Blu-ray menu: enabled\n");
         }
     }
-    else if (is_online) {
-        m = libvlc_media_new_location(core.libvlc, path);
+             else if (is_online) {
+    m = libvlc_media_new_location(core.libvlc, path);
+    fprintf(stderr, "[VLC] Opening online stream: %s\n", path);
+    libvlc_media_add_option(m, ":demux=avformat");
+    libvlc_media_add_option(m, ":network-caching=5000");
+    libvlc_media_add_option(m, ":live-caching=2500");
+    libvlc_media_add_option(m, ":http-reconnect");
+    libvlc_media_add_option(m, ":avcodec-hw=none");
+
+       if (ctts_fix_enabled) {
+        fprintf(stderr, "[VLC] Applying aggressive CTTS fix (no seek, huge cache)\n");
+        libvlc_media_add_option(m, ":demux=avformat");
+        libvlc_media_add_option(m, ":no-seekable");  // treat as non-seekable stream – bypasses CTTS
+        libvlc_media_add_option(m, ":network-caching=120000");
+        libvlc_media_add_option(m, ":live-caching=60000");
+        // Single combined avformat-options line – all flags together
+        libvlc_media_add_option(m, ":avformat-options=analyzeduration=600000000:probesize=800000000:fflags=+genpts+igndts+discardcorrupt+fastseek:use_editlist=0:ignore_editlist=1");
+    } else {
+        libvlc_media_add_option(m, ":demux=avformat");
+        libvlc_media_add_option(m, ":network-caching=5000");
+        libvlc_media_add_option(m, ":live-caching=2500");
     }
+}
     else {
         m = libvlc_media_new_path(core.libvlc, path);
     }
+ 
 
     if (!m) {
         fprintf(stderr, "[VLC] Failed to create media\n");
@@ -232,11 +268,11 @@ vlc_audio_flush();                     // ← stronger flush
     }
 
     // --- Common options (demux + ONE video-filter + ONE audio-filter) ---
-    if (strcasestr(path, ".m3u8")) {
-        libvlc_media_add_option(m, ":demux=adaptive");
-    } else {
-        libvlc_media_add_option(m, ":demux=avformat");
-    }
+if (strcasestr(path, ".m3u8")) {
+    libvlc_media_add_option(m, ":demux=adaptive");
+} else if (!is_online) {   // only local files get the default avformat
+    libvlc_media_add_option(m, ":demux=avformat");
+}
 
     // === INDIVIDUAL VIDEO FILTERS (only ONE :video-filter= line) ===
     char vfilters[256] = {0};
@@ -448,19 +484,61 @@ var.key = "vlc_sharpen_sigma";
         fprintf(stderr, "[VLC] Stereo mode set to %s\n", var.value);
     }
 
-    // Audio visualisation (fixed for pure audio files)
+  // === AUDIO VISUALISATION (force vmem output + correct size per plugin) ===
     var.key = "vlc_audio_visual";
-if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value && strcmp(var.value, "none") != 0) {
-    // Always use the 'visual' plugin
-    libvlc_media_add_option(m, ":audio-visual=visual");
-    // Set the effect (spectrometer, spectrum, scope, vu)
-    char effect_opt[64];
-    snprintf(effect_opt, sizeof(effect_opt), ":effect-list=%s", var.value);
-    libvlc_media_add_option(m, effect_opt);
-    // Force a video canvas for pure audio files
-   libvlc_media_add_option(m, ":effect-width=640");
-        libvlc_media_add_option(m, ":effect-height=360");
-  }
+    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value && strcmp(var.value, "none") != 0) {
+        const char *viz = var.value;
+        char audio_visual[32] = "visual";
+        char effect_list[32] = "";
+
+        if (strcmp(viz, "goom") == 0) {
+            strcpy(audio_visual, "goom");
+        } else if (strcmp(viz, "projectm") == 0) {
+            strcpy(audio_visual, "projectm");
+        } else if (strcmp(viz, "glspectrum") == 0) {
+            strcpy(audio_visual, "glspectrum");
+        } else {
+            strcpy(audio_visual, "visual");
+            strncpy(effect_list, viz, sizeof(effect_list)-1);
+        }
+
+        char opt[64];
+        snprintf(opt, sizeof(opt), ":audio-visual=%s", audio_visual);
+        libvlc_media_add_option(m, opt);
+
+        if (effect_list[0]) {
+            snprintf(opt, sizeof(opt), ":effect-list=%s", effect_list);
+            libvlc_media_add_option(m, opt);
+        }
+
+        // === CRITICAL: Force vmem output and size (this was missing) ===
+        libvlc_media_add_option(m, ":vout=vmem");
+        libvlc_media_add_option(m, ":vmem-chroma=RV32");   // matches XRGB8888
+        libvlc_media_add_option(m, ":vmem-width=854");
+        libvlc_media_add_option(m, ":vmem-height=480");
+        libvlc_media_add_option(m, ":vmem-pitch=3416");    // 854 * 4 bytes
+
+        // Plugin-specific size (goom/glspectrum/projectm need their own)
+        if (strcmp(viz, "goom") == 0) {
+            libvlc_media_add_option(m, ":goom-width=854");
+            libvlc_media_add_option(m, ":goom-height=480");
+        } else if (strcmp(viz, "projectm") == 0) {
+            libvlc_media_add_option(m, ":projectm-width=854");
+            libvlc_media_add_option(m, ":projectm-height=480");
+        } else if (strcmp(viz, "glspectrum") == 0) {
+            libvlc_media_add_option(m, ":glspectrum-width=854");
+            libvlc_media_add_option(m, ":glspectrum-height=480");
+        } else {
+            libvlc_media_add_option(m, ":effect-width=854");
+            libvlc_media_add_option(m, ":effect-height=480");
+        }
+
+        // Global canvas fallback
+        libvlc_media_add_option(m, ":width=854");
+        libvlc_media_add_option(m, ":height=480");
+
+        fprintf(stderr, "[VLC] Audio visualization ENABLED: %s (audio-visual=%s + vmem forced)\n", viz, audio_visual);
+    }
 
     // Audio resampler and quality
     var.key = "vlc_audio_resampler";
@@ -538,7 +616,8 @@ if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value && strcmp(var.
 
     pthread_mutex_lock(&core.mutex);
     core.transitioning = true;
-    core.transition_timeout_frames = is_online ? 7200 : 14400;
+        core.transition_timeout_frames = is_online ? 180000 : 14400;   // ~3 minutes for slow streams
+    core.audio_mute_frames = is_online ? 180 : 60;                 // 3 seconds guaranteed silence on online
     if (core.video_buffer && core.video_pitch > 0 && core.video_height > 0) {
         memset(core.video_buffer, 0, core.video_pitch * core.video_height);
     }
@@ -667,7 +746,8 @@ RETRO_API void retro_set_environment(retro_environment_t cb) {
         { "vlc_media_type", "Media type; auto|dvd|bluray|file" },
         { "vlc_dvd_menu", "DVD menu behavior; normal|force|disable" },
         { "vlc_bluray_menu", "Blu-ray menu behavior; normal|disable" },
-        { "vlc_spu_enable", "Enable subtitles/overlays; auto|yes|no" },
+        { "vlc_ctts_fix", "Aggressive CTTS fix for broken MP4; disabled|enabled" },
+		{ "vlc_spu_enable", "Enable subtitles/overlays; auto|yes|no" },
         { "vlc_spu_track", "Subtitle/SPU track; 0|1|2|3|4|5|6|7|8|9" },
         { "vlc_x11_threads", "X11 thread safety; disabled|enabled" },
         { "vlc_overlay_debug", "Overlay debug mode; disabled|enabled" },
@@ -695,7 +775,7 @@ RETRO_API void retro_set_environment(retro_environment_t cb) {
         { "vlc_audio_track", "Audio track; 0|1|2|3|4|5" },
         { "vlc_audio_channels", "Audio channels; 2 (Stereo)|1 (Mono)|4|5|6" },
         { "vlc_stereo_mode", "Stereo mode; Stereo|Left|Right|Reverse" },
-        { "vlc_audio_visual", "Audio visualisation; none|spectrometer|spectrum|scope|vu" },
+        { "vlc_audio_visual", "Audio visualisation; none|libgoom|goom|projectm|glspectrum|spectrum|spectrometer|scope|vu" },
         { "vlc_af_equalizer",   "Audio: Equalizer; disabled|enabled" },
         { "vlc_af_compressor",  "Audio: Compressor; disabled|enabled" },
         { "vlc_af_karaoke",     "Audio: Karaoke; disabled|enabled" },
@@ -725,22 +805,20 @@ void retro_init(void) {
     fprintf(stderr, "[VLC] retro_init() called\n");
     pthread_mutex_init(&core.mutex, NULL);
 
-    // Read X11 thread safety option
+    // X11 thread safety
     struct retro_variable var = {0};
     var.key = "vlc_x11_threads";
     bool x11_threads = false;
     if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value) {
-        if (strcmp(var.value, "enabled") == 0) {
-            x11_threads = true;
-        }
+        if (strcmp(var.value, "enabled") == 0) x11_threads = true;
     }
 
-    // Build args dynamically
+    // === BASE VLC ARGUMENTS ===
     const char* base_args[] = {
+		"--quiet",
         "--no-video-title-show",
         "--clock-jitter=0",
-        "--network-caching=20000",
-        "--file-caching=10000",
+       
         "--live-caching=20000",
         "--http-reconnect",
         "--vout=vmem",
@@ -749,47 +827,56 @@ void retro_init(void) {
         "--audio-resampler",
         "--ac3-float",
         "--spu",
+        "--no-plugins-cache",
+        "--ignore-config",
         NULL
     };
 
     int arg_count = 0;
     while (base_args[arg_count] != NULL) arg_count++;
 
-    const char** args = malloc((arg_count + 2) * sizeof(char*));
-    for (int i = 0; i < arg_count; i++) {
-        args[i] = base_args[i];
-    }
+    const char** args = malloc((arg_count + 3) * sizeof(char*));
+    for (int i = 0; i < arg_count; i++) args[i] = base_args[i];
 
-    if (x11_threads) {
-        args[arg_count++] = "--no-xlib";
-        fprintf(stderr, "[VLC] X11 thread safety enabled\n");
-    }
+    if (x11_threads) args[arg_count++] = "--no-xlib";
     args[arg_count] = NULL;
 
+    // === SET VLC_PLUGIN_PATH (this is the only way that works now) ===
+    const char *core_path = NULL;
+    const char *sys_dir = NULL;
+    environ_cb(RETRO_ENVIRONMENT_GET_LIBRETRO_PATH, &core_path);
+    environ_cb(RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY, &sys_dir);
+
+    char root[4096] = {0};
+    if (core_path) {
+        strncpy(root, core_path, sizeof(root)-1);
+        char *sep = strrchr(root, '/'); if (!sep) sep = strrchr(root, '\\');
+        if (sep) *sep = '\0';                    // cores
+        sep = strrchr(root, '/'); if (!sep) sep = strrchr(root, '\\');
+        if (sep) *sep = '\0';                    // RetroArch root
+    }
+
+    char env[8192];
+    if (strlen(root) > 0) {
+        snprintf(env, sizeof(env), "VLC_PLUGIN_PATH=%s/retroarch-plugins-visualization;%s/plugins;%s/plugins/visualization",
+                 root, root, root);
+    } else if (sys_dir) {
+        snprintf(env, sizeof(env), "VLC_PLUGIN_PATH=%s/retroarch-plugins-visualization;%s/plugins;%s/plugins/visualization",
+                 sys_dir, sys_dir, sys_dir);
+    } else {
+        strcpy(env, "VLC_PLUGIN_PATH=plugins");
+    }
+
+    _putenv(env);
+    fprintf(stderr, "[VLC] Set VLC_PLUGIN_PATH = %s\n", env + 15);
+
+    // === CREATE VLC ===
     core.libvlc = libvlc_new(arg_count, args);
     free(args);
-#ifdef _WIN32
-    // Try to get the function pointer from the libvlc DLL
-    HMODULE hLib = GetModuleHandle("libvlc.dll");
-    if (!hLib) {
-        // Some systems might have a different name
-        hLib = GetModuleHandle("libvlc");
-    }
-    if (hLib) {
-        dyn_libvlc_video_set_mouse_position = (pfn_libvlc_video_set_mouse_position)GetProcAddress(hLib, "libvlc_video_set_mouse_position");
-        if (dyn_libvlc_video_set_mouse_position) {
-            fprintf(stderr, "[VLC] Found libvlc_video_set_mouse_position\n");
-        } else {
-            fprintf(stderr, "[VLC] libvlc_video_set_mouse_position not found in DLL\n");
-        }
-    } else {
-        fprintf(stderr, "[VLC] Could not get handle to libvlc DLL\n");
-    }
-#endif
 
     if (core.libvlc) {
         libvlc_log_set(core.libvlc, log_cb, NULL);
-        fprintf(stderr, "[VLC] VLC instance created\n");
+        fprintf(stderr, "[VLC] VLC instance created successfully\n");
 
         static const struct retro_frame_time_callback frame_time_cb = { NULL, 1000 };
         environ_cb(RETRO_ENVIRONMENT_SET_FRAME_TIME_CALLBACK, (void*)&frame_time_cb);
@@ -797,6 +884,18 @@ void retro_init(void) {
         fprintf(stderr, "[VLC] Failed to create VLC instance\n");
     }
 
+#ifdef _WIN32
+    HMODULE hLib = GetModuleHandle("libvlc.dll");
+    if (!hLib) hLib = GetModuleHandle("libvlc");
+    if (hLib) {
+        dyn_libvlc_video_set_mouse_position = (pfn_libvlc_video_set_mouse_position)
+            GetProcAddress(hLib, "libvlc_video_set_mouse_position");
+        if (dyn_libvlc_video_set_mouse_position)
+            fprintf(stderr, "[VLC] Found libvlc_video_set_mouse_position\n");
+    }
+#endif
+
+    // === CORE STATE ===
     core.video_fps = 60.0;
     core.seeking = false;
     core.is_playing = false;
@@ -815,17 +914,14 @@ void retro_init(void) {
     core.video_width = 0;
     core.video_height = 0;
     core.video_pitch = 0;
-	core.last_video_presented_ms = 0;
-	core.spu_initialized = false;
-
+    core.last_video_presented_ms = 0;
+    core.spu_initialized = false;
     core.sample_accum_frac = 0.0;
-	    core.max_width         = MAX_W;
-    core.max_height        = MAX_H;
+    core.max_width = MAX_W;
+    core.max_height = MAX_H;
     core.audio_mute_frames = 0;
-    core.audio_desync_ms   = 0;
-  
+    core.audio_desync_ms = 0;
 }
-
 RETRO_API bool retro_load_game(const struct retro_game_info *info) {
     fprintf(stderr, "[VLC] Loading: %s\n", info->path);
 
@@ -879,7 +975,7 @@ static int16_t silence_buffer[48000 * 2]; // large enough for one frame
     if (!core.libvlc || !core.mp) return;
 if (core.pending_start && core.mp)
 {
-    fprintf(stderr, "[VLC] Starting playback on first active frame\n");
+  
     libvlc_media_player_play(core.mp);
     core.pending_start = false;
 }
@@ -924,12 +1020,11 @@ prev_select = select;
     if (x && !prev_x) {
         core.paused = !core.paused;
         libvlc_media_player_set_pause(core.mp, core.paused ? 1 : 0);
-        fprintf(stderr, "[VLC] %s\n", core.paused ? "Paused" : "Resumed");
-    }
+     }
     prev_x = x;
 
     // If paused, output silence and last video frame, then return
-    if (core.paused || !core.is_playing) {
+    if (core.paused) {
     memset(silence_buffer, 0, samples_per_frame * 2 * sizeof(int16_t));
     audio_batch_cb(silence_buffer, samples_per_frame);
 
@@ -993,8 +1088,7 @@ if (core.is_playing && mouse_enabled && core.mp) {
 } else {
     static int mouse_warn_once = 0;
     if (!mouse_warn_once) {
-        fprintf(stderr, "[VLC] Mouse position not supported by this libVLC version\n");
-        mouse_warn_once = 1;
+             mouse_warn_once = 1;
     }
 }
     
@@ -1003,8 +1097,7 @@ if (core.is_playing && mouse_enabled && core.mp) {
     bool left = input_state_cb(0, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_LEFT);
     if (left && !prev_left) {
         libvlc_media_player_navigate(core.mp, libvlc_navigate_activate);
-        fprintf(stderr, "[VLC] Mouse click at (%d, %d)\n", abs_x, abs_y);
-    }
+     }
     prev_left = left;
     
     // Optionally map A button to mouse click
@@ -1021,7 +1114,6 @@ if (core.is_playing && mouse_enabled && core.mp) {
         bool a = input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_A);
         if (a && !prev_a_mouse) {
             libvlc_media_player_navigate(core.mp, libvlc_navigate_activate);
-            fprintf(stderr, "[VLC] A button as mouse click\n");
         }
         prev_a_mouse = a;
     }
@@ -1044,14 +1136,15 @@ if (core.is_playing && core.mp && b && !prev_b_cycle) {
         libvlc_video_set_aspect_ratio(core.mp, NULL);
     else
         libvlc_video_set_aspect_ratio(core.mp, new_aspect);
-    fprintf(stderr, "[VLC] B button: aspect ratio set to %s\n", new_aspect);
-}
+    }
 prev_b_cycle = b;
 
 
 
 // ===== RUNTIME OPTION CHANGES =====
-if (core.mp && core.is_playing) {
+
+static int option_check = 0;
+if (core.mp && core.is_playing && (++option_check % 30 == 0)) {   // check only every 30 frames
     static struct {
         int  spu_enable;      // -1=no, 0=auto, 1=yes (we'll store as int for comparison)
         int  spu_track;
@@ -1084,20 +1177,17 @@ if (core.mp && core.is_playing) {
         int spu_count = libvlc_video_get_spu_count(core.mp);
         if (spu_enable_val == -1) {
             libvlc_video_set_spu(core.mp, -1);
-            fprintf(stderr, "[VLC] Runtime SPU disabled\n");
         } else if (spu_enable_val == 1) {
             // yes: use selected track (clamp if needed)
             if (spu_track_val < 0) spu_track_val = 0;
             if (spu_count > 0 && spu_track_val >= spu_count)
                 spu_track_val = spu_count - 1;
             libvlc_video_set_spu(core.mp, spu_track_val);
-            fprintf(stderr, "[VLC] Runtime SPU track set to %d\n", spu_track_val);
         } else { // auto
             if (spu_count > 0)
                 libvlc_video_set_spu(core.mp, 0);
             else
                 libvlc_video_set_spu(core.mp, -1);
-            fprintf(stderr, "[VLC] Runtime SPU auto: %s\n", spu_count > 0 ? "enabled track 0" : "disabled");
         }
         prev.spu_enable = spu_enable_val;
         prev.spu_track = spu_track_val;
@@ -1132,7 +1222,6 @@ if (strcmp(aspect_str, prev.aspect) != 0) {
 
     environ_cb(RETRO_ENVIRONMENT_SET_GEOMETRY, &geo);
 
-    fprintf(stderr, "[VLC] Aspect ratio changed to %s (notified frontend)\n", aspect_str);
     strncpy(prev.aspect, aspect_str, sizeof(prev.aspect)-1);
     prev.aspect[sizeof(prev.aspect)-1] = '\0';
 }
@@ -1147,7 +1236,6 @@ if (strcmp(aspect_str, prev.aspect) != 0) {
             libvlc_video_set_crop_geometry(core.mp, NULL);
         else
             libvlc_video_set_crop_geometry(core.mp, crop_str);
-        fprintf(stderr, "[VLC] Runtime crop set to %s\n", crop_str);
         strncpy(prev.crop, crop_str, sizeof(prev.crop));
     }
 
@@ -1159,7 +1247,6 @@ if (strcmp(aspect_str, prev.aspect) != 0) {
     if (audio_track_val != prev.audio_track) {
         if (audio_track_val > 0) {
             libvlc_audio_set_track(core.mp, audio_track_val);
-            fprintf(stderr, "[VLC] Runtime audio track set to %d\n", audio_track_val);
         }
         prev.audio_track = audio_track_val;
     }
@@ -1171,7 +1258,6 @@ if (strcmp(aspect_str, prev.aspect) != 0) {
         audio_desync_val = atoi(var.value);
     if (audio_desync_val != prev.audio_desync) {
         libvlc_audio_set_delay(core.mp, audio_desync_val * 1000); // convert ms to µs
-        fprintf(stderr, "[VLC] Runtime audio delay set to %d ms\n", audio_desync_val);
         prev.audio_desync = audio_desync_val;
     }
 
@@ -1186,7 +1272,6 @@ if (strcmp(aspect_str, prev.aspect) != 0) {
             libvlc_video_set_deinterlace(core.mp, NULL);
         else
             libvlc_video_set_deinterlace(core.mp, deint_str);
-        fprintf(stderr, "[VLC] Runtime deinterlace mode set to %s\n", deint_str);
         strncpy(prev.deint, deint_str, sizeof(prev.deint));
         prev.deint[sizeof(prev.deint)-1] = '\0'; // ensure null termination
     }
@@ -1203,18 +1288,14 @@ if (strcmp(aspect_str, prev.aspect) != 0) {
             // auto: enable first track if any, else disable
             if (spu_count > 0) {
                 libvlc_video_set_spu(core.mp, 0);
-                fprintf(stderr, "[VLC] Runtime subtitle auto: enabled track 0\n");
             } else {
                 libvlc_video_set_spu(core.mp, -1);
-                fprintf(stderr, "[VLC] Runtime subtitle auto: no tracks, disabled\n");
             }
         } else if (sub_track_val > 0 && sub_track_val <= spu_count) {
             libvlc_video_set_spu(core.mp, sub_track_val);
-            fprintf(stderr, "[VLC] Runtime subtitle track set to %d\n", sub_track_val);
         } else {
             // invalid track, disable
             libvlc_video_set_spu(core.mp, -1);
-            fprintf(stderr, "[VLC] Runtime subtitle track %d invalid, disabled\n", sub_track_val);
         }
         prev.sub_track = sub_track_val;
     }
@@ -1228,7 +1309,6 @@ if (strcmp(aspect_str, prev.aspect) != 0) {
         if (r2 && !prev_r2) new_index = (core.playlist_index + 1) % core.playlist_size;
 
         if (new_index != core.playlist_index) {
-            fprintf(stderr, "[VLC] Switching track %d → %d\n", core.playlist_index, new_index);
                         if (load_media_file(core.playlist[new_index])) {
                 core.playlist_index = new_index;
                 core.audio_sent_frames = 0;
@@ -1260,50 +1340,55 @@ load_media_file(core.playlist[core.playlist_index]);
         core.sync_offset = 0;
         core.sync_offset_initialized = false;
         core.last_audio_pts = 0;
-        fprintf(stderr, "[VLC] Seek to %lld ms\n", (long long)new_time);
     }
     prev_l1 = l1; prev_r1 = r1;
 
-    if (core.transitioning) {
-        pthread_mutex_lock(&core.mutex);
-        bool ready = (core.video_width > 0 && core.video_height > 0 && core.video_buffer != NULL);
-        pthread_mutex_unlock(&core.mutex);
+if (core.transitioning) {
+    pthread_mutex_lock(&core.mutex);
+    bool ready = (core.video_width > 0 && core.video_height > 0 && core.video_buffer != NULL);
+    pthread_mutex_unlock(&core.mutex);
 
-        if (ready || --core.transition_timeout_frames == 0) {
-            if (ready) {
-                update_fps_from_current_media();
-                struct retro_system_av_info av_info = {0};
-                av_info.geometry.base_width   = core.video_width;
-                av_info.geometry.base_height  = core.video_height;
-                av_info.geometry.max_width    = MAX_W;
-                av_info.geometry.max_height   = MAX_H;
-                av_info.geometry.aspect_ratio = (float)core.video_width / core.video_height;
-                av_info.timing.fps            = core.video_fps > 0 ? core.video_fps : 60.0;
-                av_info.timing.sample_rate    = AUDIO_TARGET_RATE;
-                environ_cb(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &av_info);
-                fprintf(stderr, "[VLC] Track switch complete: %ux%u @ %.3f fps\n", core.video_width, core.video_height, core.video_fps);
-            } else {
-                fprintf(stderr, "[VLC] Track switch timeout\n");
-                pthread_mutex_lock(&core.mutex);
-                if (core.video_buffer) memset(core.video_buffer, 0, core.video_pitch * core.video_height);
-                pthread_mutex_unlock(&core.mutex);
-            }
-            core.transitioning = false;
-			pthread_mutex_lock(&core.mutex);
-core.audio_mute_frames = 0;                // ← ready to play
-			pthread_mutex_unlock(&core.mutex);
-
-			
-			
-			// Reset audio sync to start fresh with correct FPS
-core.audio_sent_frames = 0;
-core.sync_offset_initialized = false;
-core.sample_accum_frac = 0.0;
+    if (ready || --core.transition_timeout_frames == 0) {
+        if (ready) {
+            update_fps_from_current_media();
+            struct retro_system_av_info av_info = {0};
+            av_info.geometry.base_width   = core.video_width;
+            av_info.geometry.base_height  = core.video_height;
+            av_info.geometry.max_width    = MAX_W;
+            av_info.geometry.max_height   = MAX_H;
+            av_info.geometry.aspect_ratio = (float)core.video_width / core.video_height;
+            av_info.timing.fps            = core.video_fps > 0 ? core.video_fps : 60.0;
+            av_info.timing.sample_rate    = AUDIO_TARGET_RATE;
+            environ_cb(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &av_info);
+        } else {
+            pthread_mutex_lock(&core.mutex);
+            if (core.video_buffer) memset(core.video_buffer, 0, core.video_pitch * core.video_height);
+            pthread_mutex_unlock(&core.mutex);
         }
+        core.transitioning = false;
+        pthread_mutex_lock(&core.mutex);
+        core.audio_mute_frames = 0;                // ready to play
+        pthread_mutex_unlock(&core.mutex);
+        // Do NOT reset audio sync here – let it run naturally
+    } else {
+        // Still transitioning: output silence and current video frame, then return
+        static int16_t silence[512] = {0};
+        audio_batch_cb(silence, 512);
+
+        pthread_mutex_lock(&core.mutex);
+        uint32_t *safe_buf = core.video_buffer;
+        unsigned safe_w = core.video_width;
+        unsigned safe_h = core.video_height;
+        unsigned safe_p = core.video_pitch;
+        pthread_mutex_unlock(&core.mutex);
+        if (video_cb && safe_buf && safe_w > 0 && safe_h > 0) {
+            video_cb(safe_buf, safe_w, safe_h, safe_p);
+        }
+        return;
     }
+}
    
    if (state == libvlc_Error && core.playlist_mode) {
-        fprintf(stderr, "[VLC] Media error → auto-next track\n");
         int new_index = (core.playlist_index + 1) % core.playlist_size;
 load_media_file(core.playlist[new_index]);
         core.playlist_index = new_index;
@@ -1339,8 +1424,6 @@ if (core.is_playing && audio_batch_cb) {
     if (!core.sync_offset_initialized && pts_frames > 0) {
         core.sync_offset = pts_frames - core.audio_sent_frames - target_delay_frames;
         core.sync_offset_initialized = true;
-        fprintf(stderr, "[VLC] PTS sync calibrated: target delay %lld frames (200 ms)\n",
-                (long long)target_delay_frames);
     }
 
     if (!core.sync_offset_initialized) {
@@ -1356,8 +1439,6 @@ if (core.is_playing && audio_batch_cb) {
     // Detect large jump (> 1 second) and recalibrate
     const int64_t JUMP_THRESHOLD = AUDIO_TARGET_RATE; // 1 second at 48 kHz
     if (llabs(error) > JUMP_THRESHOLD) {
-        fprintf(stderr, "[VLC] Large sync jump detected (%lld frames), recalibrating\n",
-                (long long)error);
         core.sync_offset = pts_frames - core.audio_sent_frames - target_delay_frames;
         error = pts_frames - core.sync_offset - core.audio_sent_frames; // should now be near target_delay
     }
@@ -1436,8 +1517,6 @@ RETRO_API void retro_get_system_av_info(struct retro_system_av_info *info) {
     info->timing.fps            = fps;
     info->timing.sample_rate    = AUDIO_TARGET_RATE;
 
-    fprintf(stderr, "[VLC] Reporting AV Info: %ux%u, FPS=%.3f\n",
-            info->geometry.base_width, info->geometry.base_height, fps);
 }
 
 RETRO_API void retro_get_system_info(struct retro_system_info *i) {

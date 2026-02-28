@@ -9,12 +9,10 @@ static void audio_play(void *data, const void *samples, unsigned count, int64_t 
     if (!samples || count == 0) return;
 
     pthread_mutex_lock(&core.mutex);
-    core.last_audio_pts = pts;                    // ← ALWAYS update PTS
+    core.last_audio_pts = pts;                    // always update PTS
 
     if (core.audio_mute_frames > 0) {
-        core.audio_mute_frames--;
-        pthread_mutex_unlock(&core.mutex);
-        return;                                   // just silence the ring, PTS still moves
+        core.audio_mute_frames--;                 // count down even if we still write
     }
 
     // normal copy to ring...
