@@ -1,42 +1,22 @@
-#include <stdlib.h>
-#include <string.h>
-#include <pthread.h>
 #include <stdint.h>
-#include <stdio.h>
 #include "vlc_core.h"
 
-static void audio_play(void *data, const void *samples, unsigned count, int64_t pts) {
-    if (!samples || count == 0) return;
+static void audio_play(void *data, const void *samples, unsigned count, int64_t pts)
+{
+    (void)data;
+    (void)pts;                     // VLC is the master clock → we ignore PTS
 
-    pthread_mutex_lock(&core.mutex);
-    core.last_audio_pts = pts;                    // always update PTS
+    if (!samples || count == 0 || !audio_batch_cb)
+        return;
 
-    if (core.audio_mute_frames > 0) {
-        core.audio_mute_frames--;                 // count down even if we still write
-    }
-
-    // normal copy to ring...
-    const int16_t *src = (const int16_t *)samples;
-    size_t total = count * 2;
-    for (size_t i = 0; i < total; i++) {
-        core.audio_ring[core.audio_write_pos] = src[i];
-        core.audio_write_pos = (core.audio_write_pos + 1) % AUDIO_BUFFER_SIZE;
-        if (core.audio_write_pos == core.audio_read_pos)
-            core.audio_read_pos = (core.audio_read_pos + 1) % AUDIO_BUFFER_SIZE;
-    }
-    pthread_mutex_unlock(&core.mutex);
+    // === THIS IS THE ENTIRE AUDIO PATH NOW ===
+    // No ring buffer. No accumulation. No silence. No mute_frames.
+    // If RetroArch isn't consuming → samples are dropped (correct bridge behavior).
+    audio_batch_cb((const int16_t *)samples, count);
 }
 
-void vlc_audio_flush(void) {
-    pthread_mutex_lock(&core.mutex);
-    core.audio_read_pos = 0;
-    core.audio_write_pos = 0;
-    memset(core.audio_ring, 0, sizeof(core.audio_ring));
-    core.last_audio_pts = 0;
-    pthread_mutex_unlock(&core.mutex);
-}
-
-void vlc_audio_setup_callbacks(libvlc_media_player_t *mp) {
+void vlc_audio_setup_callbacks(libvlc_media_player_t *mp)
+{
     libvlc_audio_set_callbacks(mp, audio_play, NULL, NULL, NULL, NULL, NULL);
     libvlc_audio_set_format(mp, "S16N", AUDIO_TARGET_RATE, 2);
 }

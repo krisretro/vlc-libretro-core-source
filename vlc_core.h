@@ -4,12 +4,11 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <pthread.h>
-#include <vlc/vlc.h>
+#include <vlc/vlc.h>          // ← MUST be here before any libvlc types
 #include "libretro.h"
 
 #define MAX_W 1920
 #define MAX_H 1080
-#define AUDIO_BUFFER_SIZE (4 * 1024 * 1024)
 #define AUDIO_TARGET_RATE 48000
 
 typedef struct {
@@ -21,46 +20,38 @@ typedef struct {
     unsigned video_height;
     unsigned video_pitch;
 
-    int16_t audio_ring[AUDIO_BUFFER_SIZE];
-    size_t audio_read_pos;
-    size_t audio_write_pos;
-    
-    int64_t audio_sent_frames;
-    int64_t sync_offset;
-    bool sync_offset_initialized;
-
     double video_fps;
-    int64_t last_video_pts;
-    int64_t last_audio_pts;
-    int64_t frame_time;
     
     bool is_playing;
-    bool seeking;
-    int64_t seek_target;
-    int64_t last_vlc_time;
-    bool paused;                      // user pause state
-    
+    bool paused;
+    bool seeking;               // kept — used by L1/R1 seek
+
     char **playlist;
     int playlist_size;
     int playlist_index;
     bool playlist_mode;
-    bool transitioning;
-    uint32_t transition_timeout_frames;
+bool pending_play;
+bool play_start_attempt;     
+int  play_attempt_frames;    
     pthread_mutex_t mutex;
-    int64_t last_video_presented_ms;
-    double sample_accum_frac;          // fractional accumulator for audio output
-    bool pending_start;                 // delay initial playback until first retro_run
-  bool spu_initialized;   // whether subpicture track has been enabled
-      int  audio_mute_frames;   // countdown of frames to force silence after load/seek
-	  int   audio_desync_ms;            // NEW: persistent user value
-	  unsigned max_width;      // NEW
-   unsigned max_height;     // NEW
+    
+    unsigned max_width;
+    unsigned max_height;
+	    bool menu_active;        
+		bool iptv_menu_enabled;
+    int  menu_selection;        
 } vlc_core_ctx;
 
 extern vlc_core_ctx core;
-
+extern retro_environment_t environ_cb;
+extern retro_video_refresh_t video_cb;
+extern retro_audio_sample_batch_t audio_batch_cb;
+bool vlc_menu_init(const char *m3u_path);
+void vlc_menu_handle_input(void);
+void vlc_menu_deinit(void);
 void vlc_video_setup_callbacks(libvlc_media_player_t *mp);
 void vlc_audio_setup_callbacks(libvlc_media_player_t *mp);
-void vlc_audio_flush(void);
+bool switch_to_media(const char *path);
+void vlc_menu_draw(void);
 
 #endif

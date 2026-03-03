@@ -9,7 +9,7 @@ LDFLAGS := -shared -static-libgcc -static-libstdc++
 LIBS := -Wl,-Bstatic -lwinpthread -Wl,-Bdynamic $(VLC_LIBS)
 
 TARGET := $(CORE_NAME).dll
-OBJS := vlc_core.o vlc_video.o vlc_audio.o
+OBJS := vlc_core.o vlc_video.o vlc_audio.o vlc_menu.o
 
 all: $(TARGET)
 
