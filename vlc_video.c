@@ -3,35 +3,41 @@
 #include <pthread.h>
 #include <stdio.h>
 #include "vlc_core.h"
-
+static int stitching = 0;
+static int frames_decoded = 0;  // incremented in lock_cb; guards stitch path at startup
 static void *lock_cb(void *data, void **planes) {
-    pthread_mutex_lock(&core.mutex);
+    /* If a same-res stitch was in progress, VLC calling lock means the gap is over */
+    if (stitching) {
+        core.transitioning = false;
+        stitching = 0;
+    }
+    frames_decoded++;  // we've had at least one real decode cycle
+
+    pthread_mutex_lock(&core.mutex);   // lock — hold until unlock_cb
+
     if (!core.video_buffer || core.video_width == 0 || core.video_height == 0) {
-        *planes = NULL;
-        pthread_mutex_unlock(&core.mutex);
+        static uint32_t fallback_buffer[640 * 360] = {0};
+        *planes = fallback_buffer;
+        // DO NOT unlock here — unlock_cb will do it
         return NULL;
     }
+
     *planes = core.video_buffer;
-    pthread_mutex_unlock(&core.mutex);   // ← critical fix
-    return core.video_buffer;
+    // DO NOT unlock here — unlock_cb will do it
+    return NULL;
 }
+
 static void unlock_cb(void *data, void *id, void *const *planes) {
-    // No need for mutex unlock here (already unlocked in lock_cb)
+    pthread_mutex_unlock(&core.mutex);  // sole unlock point
 }
 
 static unsigned setup_format_cb(void **opaque, char *chroma, unsigned *width, unsigned *height, unsigned *pitches, unsigned *lines) {
-    pthread_mutex_lock(&core.mutex);
+ 
 
-    fprintf(stderr, "[VLC] Video format change: %ux%u\n", *width, *height);
-
-    if (core.video_buffer) {
-        free(core.video_buffer);
-        core.video_buffer = NULL;
-    }
 
     memcpy(chroma, "RV32", 4);
 
-    // Clamp to max
+    // Clamp resolution BEFORE touching mutex
     if (core.max_width > 0 && *width > core.max_width) {
         float aspect = (float)*height / (float)*width;
         *width = core.max_width;
@@ -39,36 +45,64 @@ static unsigned setup_format_cb(void **opaque, char *chroma, unsigned *width, un
         if (*height > core.max_height) *height = core.max_height;
     }
 
-    core.video_width = *width;
-    core.video_height = *height;
-    core.video_pitch = *width * 4;
+    unsigned new_pitch = *width * 4;
 
-    core.video_buffer = (uint32_t*)calloc(1, (size_t)core.video_pitch * core.video_height);
-
-    if (!core.video_buffer) {
-        fprintf(stderr, "[VLC] Failed to allocate %ux%u buffer!\n", *width, *height);
-        core.video_width = core.video_height = 0;
-        pthread_mutex_unlock(&core.mutex);
+    // *** Allocate OUTSIDE mutex — this is the slow part, don't block retro_run ***
+    uint32_t *new_buf = (uint32_t*)calloc(1, (size_t)new_pitch * *height);
+    if (!new_buf) {
+        fprintf(stderr, "[VLC] CRITICAL: Failed to allocate %ux%u buffer!\n", *width, *height);
+        core.transitioning = false;
         return 0;
     }
+/* Ignore HLS stitch resets if resolution is identical */
+if (core.video_buffer &&
+    core.video_width  == *width &&
+    core.video_height == *height &&
+    core.video_pitch  == new_pitch)
+{
+    free(new_buf);   // not needed — existing buffer is reused
 
     *pitches = core.video_pitch;
-    *lines = core.video_height;
+    *lines   = core.video_height;
 
-    pthread_mutex_unlock(&core.mutex);
+    /* Only gate audio if we've already been decoding — HLS calls setup_format_cb
+       twice at startup before any frames arrive, which would otherwise lock forever */
+    if (frames_decoded > 0) {
+        stitching = 1;
+        core.transitioning = true;
+        fprintf(stderr, "[VLC] Stitch reset (%ux%u), audio gated\n", *width, *height);
+    } else {
+        fprintf(stderr, "[VLC] Ignoring early stitch reset (%ux%u), no frames yet\n", *width, *height);
+    }
+    return 1;
+}
 
-    // Use SET_GEOMETRY to avoid restart in old RetroArch
-    struct retro_game_geometry geo = {0};
-    geo.base_width   = core.video_width;
-    geo.base_height  = core.video_height;
-    geo.aspect_ratio = (float)core.video_width / core.video_height;
-    environ_cb(RETRO_ENVIRONMENT_SET_GEOMETRY, &geo);
+/* Normal buffer swap — reset frame counter for the new stream */
+frames_decoded = 0;
+   core.transitioning = true;
+    // Fast pointer swap under mutex — retro_run blocks for microseconds only
+    pthread_mutex_lock(&core.mutex);
 
+
+    free(core.video_buffer);          // old buffer freed here — no null window
+    core.video_buffer = new_buf;      // immediately valid, no black frame gap
+    core.video_width  = *width;
+    core.video_height = *height;
+    core.video_pitch  = new_pitch;
+	libvlc_audio_set_delay(core.mp, 0);
+ 		core.transitioning = false;
+		
+   pthread_mutex_unlock(&core.mutex);
+
+    fprintf(stderr, "[VLC] setup_format_cb: %ux%u\n", *width, *height);
+
+    *pitches = new_pitch;
+    *lines   = *height;
     return 1;
 }
 
 static void video_display_cb(void *data, void *id) {
-    // Nothing — retro_run displays latest
+   
 }
 
 void vlc_video_setup_callbacks(libvlc_media_player_t *mp) {

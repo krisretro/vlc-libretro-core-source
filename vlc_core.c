@@ -83,32 +83,10 @@ static libvlc_media_t* create_media(const char *path,
     // --- Read core options ---
     struct retro_variable var = {0};
 
-    var.key = "vlc_dvd_detection";
-    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value) {
-        if (strcmp(var.value, "Disabled") == 0) is_dvd = false;
-    }
-
-    var.key = "vlc_media_type";
-    const char *media_type = "auto";
-    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value) {
-        media_type = var.value;
-    }
-    if (strcmp(media_type, "dvd") == 0) {
-        is_dvd = true; is_bluray = false;
-    } else if (strcmp(media_type, "bluray") == 0) {
-        is_dvd = false; is_bluray = true;
-    } else if (strcmp(media_type, "file") == 0) {
-        is_dvd = false; is_bluray = false;
-    }
-
+   
+   
     if (is_online) {
         is_dvd = false; is_bluray = false;
-    }
-
-    var.key = "vlc_ctts_fix";
-    bool ctts_fix_enabled = false;
-    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value) {
-        ctts_fix_enabled = (strcmp(var.value, "enabled") == 0);
     }
 
     // --- Create base media ---
@@ -133,8 +111,19 @@ static libvlc_media_t* create_media(const char *path,
     if (!m) return NULL;
 
     // --- Demux selection (must come before other options that depend on type) ---
-    if (strcasestr(path, ".m3u8")) {
-        libvlc_media_add_option(m, ":demux=adaptive");
+    if (core.iptv_menu_enabled == true) {
+		    fprintf(stderr, "[VLC] IPTV MODE ********************************: %s\n", path);
+            libvlc_media_add_option(m, ":codec=avcodec");		   
+		    libvlc_media_add_option(m, ":adaptive-logic=predictive");
+			libvlc_media_add_option(m, ":network-caching=500");
+			libvlc_media_add_option(m, ":live-caching=500");
+			libvlc_media_add_option(m, ":http-reconnect");
+			libvlc_media_add_option(m, ":avcodec-hw=none");
+			//libvlc_media_add_option(m, ":adaptive-logic=bandwidth");
+			libvlc_media_add_option(m, ":adaptive-maxwidth=1920");
+			libvlc_media_add_option(m, ":adaptive-maxheight=1080");
+		libvlc_media_add_option(m, ":clock-jitter=5");
+		//	libvlc_media_add_option(m, ":no-ts-trust-pcr");
     } else if (!is_online) {
         libvlc_media_add_option(m, ":demux=avformat");
     }
@@ -145,33 +134,24 @@ static libvlc_media_t* create_media(const char *path,
         libvlc_media_add_option(m, ":live-caching=2500");
         libvlc_media_add_option(m, ":http-reconnect");
         libvlc_media_add_option(m, ":avcodec-hw=none");
-        if (ctts_fix_enabled) {
-            libvlc_media_add_option(m, ":network-caching=60000");
-            libvlc_media_add_option(m, ":avformat-options=use_editlist=0:ignore_editlist=1");
-        }
-    }
+     }
 
     // --- DVD options ---
-    if (is_dvd) {
+    if (is_dvd) 
+	{
+fprintf(stderr, "DVD MODE\n");    
+        fprintf(stderr, "[VLC] DVD MIODE *****************************: %s\n", path);
+	libvlc_media_add_option(m, ":avformat");   /* this is what enables real DVD menus + logos */
+                
+		libvlc_media_add_option(m, ":disc-caching=300");
+		libvlc_media_add_option(m, ":dvdnav");
+        libvlc_media_add_option(m, ":no-dvdnav-menu");
+        libvlc_media_add_option(m, ":no-dvdnav-mouse-events");
         libvlc_media_add_option(m, ":avcodec-hw=none");
-        // No hardcoded aspect ratio – rely on user option
-        var.key = "vlc_dvd_menu";
-        const char *dvd_menu = "normal";
-        if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
-            dvd_menu = var.value;
-        if (strcmp(dvd_menu, "disable") == 0) {
-            libvlc_media_add_option(m, ":dvdread");
-        } else {
-            libvlc_media_add_option(m, ":dvdnav");
-            if (strcmp(dvd_menu, "normal") == 0)
-                libvlc_media_add_option(m, ":no-dvdnav-menu");
-        }
-        var.key = "vlc_dvd_title";
-        if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value) {
-            char opt[32];
-            snprintf(opt, sizeof(opt), ":dvd-title=%s", var.value);
-            libvlc_media_add_option(m, opt);
-        }
+        libvlc_media_add_option(m, ":dvd-title=0");
+		libvlc_media_add_option(m, ":dvd-angle=1");
+		libvlc_media_add_option(m, ":spu");
+		
     }
 
     // --- Blu-ray options ---
@@ -186,241 +166,6 @@ static libvlc_media_t* create_media(const char *path,
             libvlc_media_add_option(m, ":bluray-menu");
     }
 
-    // --- Video filters ---
-    char vfilters[256] = {0};
-    const char *vsep = "";
-#define ADD_VFILTER(key, name) \
-    do { \
-        if (get_option_enabled(key)) { \
-            strncat(vfilters, vsep, sizeof(vfilters)-1); \
-            strncat(vfilters, name, sizeof(vfilters)-1); \
-            vsep = ","; \
-        } \
-    } while(0)
-
-    ADD_VFILTER("vlc_vf_sharpen",     "sharpen");
-    ADD_VFILTER("vlc_vf_denoise",     "hqdn3d");
-    ADD_VFILTER("vlc_vf_postproc",    "postproc");
-    ADD_VFILTER("vlc_vf_deinterlace", "deinterlace");
-    ADD_VFILTER("vlc_vf_blend",       "blend");
-
-    if (vfilters[0]) {
-        char opt[300];
-        snprintf(opt, sizeof(opt), ":video-filter=%s", vfilters);
-        libvlc_media_add_option(m, opt);
-    }
-
-    // --- Overlay debug ---
-    var.key = "vlc_overlay_debug";
-    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value) {
-        if (strcmp(var.value, "enabled") == 0) {
-            libvlc_media_add_option(m, ":sub-filter=debug");
-            libvlc_media_add_option(m, ":osd=1");
-        }
-    }
-
-    // --- DVD angle ---
-    var.key = "vlc_dvd_angle";
-    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value) {
-        char opt[32];
-        snprintf(opt, sizeof(opt), ":dvd-angle=%s", var.value);
-        libvlc_media_add_option(m, opt);
-    }
-
-    // --- Aspect ratio ---
-    var.key = "vlc_aspect_ratio";
-    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value && strcmp(var.value, "default") != 0) {
-        char opt[64];
-        snprintf(opt, sizeof(opt), ":aspect-ratio=%s", var.value);
-        libvlc_media_add_option(m, opt);
-    }
-
-    // --- Crop ---
-    var.key = "vlc_crop";
-    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value && strcmp(var.value, "default") != 0) {
-        char opt[64];
-        snprintf(opt, sizeof(opt), ":crop=%s", var.value);
-        libvlc_media_add_option(m, opt);
-    }
-
-    // --- Video track ---
-    var.key = "vlc_video_track";
-    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value) {
-        char opt[32];
-        snprintf(opt, sizeof(opt), ":video-track=%s", var.value);
-        libvlc_media_add_option(m, opt);
-    }
-
-    // --- Deinterlace mode ---
-    var.key = "vlc_deinterlace_mode";
-    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value && strcmp(var.value, "auto") != 0) {
-        char opt[64];
-        snprintf(opt, sizeof(opt), ":deinterlace-mode=%s", var.value);
-        libvlc_media_add_option(m, opt);
-    }
-
-    // --- Scaling quality ---
-    var.key = "vlc_swscale_mode";
-    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value) {
-        char opt[32];
-        snprintf(opt, sizeof(opt), ":swscale-mode=%s", var.value);
-        libvlc_media_add_option(m, opt);
-    }
-
-    // --- Post-processing quality ---
-    var.key = "vlc_postproc_quality";
-    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value) {
-        char opt[32];
-        snprintf(opt, sizeof(opt), ":postproc-quality=%s", var.value);
-        libvlc_media_add_option(m, opt);
-    }
-
-    // --- Hardware decoding – skip for DVDs (already forced none) ---
-    if (!is_dvd) {
-        var.key = "vlc_hw_decoding";
-        if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value) {
-            if (strcmp(var.value, "disabled") != 0) {
-                char hw[128];
-                if (strcmp(var.value, "auto") == 0)
-                    snprintf(hw, sizeof(hw), ":avcodec-hw=any");
-                else
-                    snprintf(hw, sizeof(hw), ":avcodec-hw=%s", var.value);
-                libvlc_media_add_option(m, hw);
-            } else {
-                libvlc_media_add_option(m, ":avcodec-hw=none");
-            }
-        }
-    }
-
-    // --- Caching ---
-    var.key = "vlc_network_caching";
-    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value) {
-        char opt[64];
-        snprintf(opt, sizeof(opt), ":network-caching=%s", var.value);
-        libvlc_media_add_option(m, opt);
-    }
-    var.key = "vlc_file_caching";
-    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value) {
-        char opt[64];
-        snprintf(opt, sizeof(opt), ":file-caching=%s", var.value);
-        libvlc_media_add_option(m, opt);
-    }
-
-    // --- Audio filters ---
-    char afilters[256] = {0};
-    const char *asep = "";
-#define ADD_AFILTER(key, name) \
-    do { \
-        if (get_option_enabled(key)) { \
-            strncat(afilters, asep, sizeof(afilters)-1); \
-            strncat(afilters, name, sizeof(afilters)-1); \
-            asep = ","; \
-        } \
-    } while(0)
-
-    ADD_AFILTER("vlc_af_equalizer",   "equalizer");
-    ADD_AFILTER("vlc_af_compressor",  "compressor");
-    ADD_AFILTER("vlc_af_karaoke",     "karaoke");
-    ADD_AFILTER("vlc_af_headphone",   "headphone");
-
-    if (afilters[0]) {
-        char opt[300];
-        snprintf(opt, sizeof(opt), ":audio-filter=%s", afilters);
-        libvlc_media_add_option(m, opt);
-    }
-
-    // --- Audio track ---
-    var.key = "vlc_audio_track";
-    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value) {
-        char opt[32];
-        snprintf(opt, sizeof(opt), ":audio-track=%s", var.value);
-        libvlc_media_add_option(m, opt);
-    }
-
-    // --- Audio channels ---
-    var.key = "vlc_audio_channels";
-    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value) {
-        char opt[32];
-        snprintf(opt, sizeof(opt), ":audio-channels=%s", var.value);
-        libvlc_media_add_option(m, opt);
-    }
-
-    // --- Stereo mode ---
-    var.key = "vlc_stereo_mode";
-    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value && strcmp(var.value, "Stereo") != 0) {
-        char opt[64];
-        snprintf(opt, sizeof(opt), ":stereo-mode=%s", var.value);
-        libvlc_media_add_option(m, opt);
-    }
-
-    // --- Audio visualisation ---
-    var.key = "vlc_audio_visual";
-    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value && strcmp(var.value, "none") != 0) {
-        const char *viz = var.value;
-        char audio_visual[32] = "visual";
-        char effect_list[32] = "";
-        if (strcmp(viz, "goom") == 0) strcpy(audio_visual, "goom");
-        else if (strcmp(viz, "projectm") == 0) strcpy(audio_visual, "projectm");
-        else if (strcmp(viz, "glspectrum") == 0) strcpy(audio_visual, "glspectrum");
-        else strncpy(effect_list, viz, sizeof(effect_list)-1);
-
-        char opt[64];
-        snprintf(opt, sizeof(opt), ":audio-visual=%s", audio_visual);
-        libvlc_media_add_option(m, opt);
-        if (effect_list[0]) {
-            snprintf(opt, sizeof(opt), ":effect-list=%s", effect_list);
-            libvlc_media_add_option(m, opt);
-        }
-        // Force vmem for visualisation
-        libvlc_media_add_option(m, ":vout=vmem");
-        libvlc_media_add_option(m, ":vmem-chroma=RV32");
-        libvlc_media_add_option(m, ":vmem-width=854");
-        libvlc_media_add_option(m, ":vmem-height=480");
-        libvlc_media_add_option(m, ":vmem-pitch=3416");
-    }
-
-    // --- Audio resampler ---
-    var.key = "vlc_audio_resampler";
-    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value) {
-        if (strcmp(var.value, "soxr") == 0) {
-            libvlc_media_add_option(m, ":audio-resampler=soxr");
-            var.key = "vlc_soxr_quality";
-            if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value) {
-                char opt[32];
-                snprintf(opt, sizeof(opt), ":soxr-quality=%s", var.value);
-                libvlc_media_add_option(m, opt);
-            }
-        } else {
-            libvlc_media_add_option(m, ":audio-resampler=ugly");
-        }
-    }
-
-    // --- Subtitles ---
-    var.key = "vlc_sub_track";
-    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value) {
-        char opt[32];
-        snprintf(opt, sizeof(opt), ":sub-track=%s", var.value);
-        libvlc_media_add_option(m, opt);
-    }
-    var.key = "vlc_sub_margin";
-    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value) {
-        char opt[32];
-        snprintf(opt, sizeof(opt), ":sub-margin=%s", var.value);
-        libvlc_media_add_option(m, opt);
-    }
-    var.key = "vlc_sub_size";
-    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value && strcmp(var.value, "default") != 0) {
-        char opt[64];
-        if (strcmp(var.value, "small") == 0)
-            snprintf(opt, sizeof(opt), ":sub-size=12");
-        else if (strcmp(var.value, "medium") == 0)
-            snprintf(opt, sizeof(opt), ":sub-size=18");
-        else if (strcmp(var.value, "large") == 0)
-            snprintf(opt, sizeof(opt), ":sub-size=24");
-        else
-            snprintf(opt, sizeof(opt), ":sub-size=%s", var.value);
-        libvlc_media_add_option(m, opt);
-    }
 
     if (out_is_dvd)    *out_is_dvd = is_dvd;
     if (out_is_online) *out_is_online = is_online;
@@ -499,14 +244,7 @@ static bool load_media_file(const char *path) {
     libvlc_media_player_set_media(core.mp, m);
     libvlc_media_release(m);
 
-    // Audio desync (runtime option)
-    struct retro_variable var = { .key = "vlc_audio_desync" };
-    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value) {
-        int desync_ms = atoi(var.value);
-        libvlc_audio_set_delay(core.mp, (int64_t)desync_ms * 1000);
-    }
-
-    core.pending_play = true;
+     core.pending_play = true;
     return true;
 }
 
@@ -687,37 +425,26 @@ void retro_init(void) {
     fprintf(stderr, "[VLC] retro_init() called\n");
     pthread_mutex_init(&core.mutex, NULL);
 
-    // X11 thread safety
-    struct retro_variable var = {0};
-    var.key = "vlc_x11_threads";
-    bool x11_threads = false;
-    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value) {
-        if (strcmp(var.value, "enabled") == 0) x11_threads = true;
-    }
+  
+  
 enum retro_pixel_format fmt = RETRO_PIXEL_FORMAT_XRGB8888;
 environ_cb(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &fmt);
     // === BASE VLC ARGUMENTS ===
     const char* base_args[] = {
-		"--quiet",
-        "--no-video-title-show",
-        "--clock-jitter=0",
-       "--intf", "dummy",
-		"--vout", "vmem",
-		"--aout", "amem",
-		"--no-video-deco",
-		"--no-embedded-video",
-		"--no-xlib",
-    "--avcodec-hw=none",
-    //    "--live-caching=20000",
-        "--http-reconnect",
-        "--sub-autodetect-file",
-        "--audio-resampler",
-        "--ac3-float",
-        "--spu",
-        "--no-plugins-cache",
-        "--ignore-config",
+		    "--no-video-title-show",
+    "--quiet",
+//    "--no-xlib",
+  //  "--no-osd",
+   // "--clock-jitter=0",
+   //     "--network-caching=2000",
+        "--file-caching=1000",
+     //   "--live-caching=2000",
+  //  "--no-audio-time-stretch",
+   "--codec=avcodec",
+    "--http-reconnect",
+    "--vout=vmem",
+    "--aout=amem"
 
-        NULL
     };
 
     int arg_count = 0;
@@ -726,8 +453,7 @@ environ_cb(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &fmt);
     const char** args = malloc((arg_count + 3) * sizeof(char*));
     for (int i = 0; i < arg_count; i++) args[i] = base_args[i];
 
-    if (x11_threads) args[arg_count++] = "--no-xlib";
-    args[arg_count] = NULL;
+   
 
     // === SET VLC_PLUGIN_PATH (this is the only way that works now) ===
     const char *core_path = NULL;
@@ -798,6 +524,7 @@ environ_cb(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &fmt);
     core.max_width = MAX_W;
     core.max_height = MAX_H;
 	core.pending_play = true;
+	core.transitioning = false;
 }
 
 static void init_menu_video_buffer(void) {
@@ -1064,35 +791,27 @@ end_inputs:
     prev_x      = x;
 
     // === VIDEO OUTPUT ===
-    pthread_mutex_lock(&core.mutex);
-    uint32_t *buf = core.video_buffer;
-    unsigned w = core.video_width;
-    unsigned h = core.video_height;
-    unsigned p = core.video_pitch;
-    pthread_mutex_unlock(&core.mutex);
-
-    if (video_cb && buf && w && h) {
-        video_cb(buf, w, h, p);
-    }
+   pthread_mutex_lock(&core.mutex);
+if (video_cb && core.video_buffer && core.video_width && core.video_height) {
+    video_cb(core.video_buffer, core.video_width, core.video_height, core.video_pitch);
+}
+pthread_mutex_unlock(&core.mutex);
 }
 
-RETRO_API void retro_get_system_av_info(struct retro_system_av_info *info)
-{
-    memset(info, 0, sizeof(*info));
+RETRO_API void retro_get_system_av_info(struct retro_system_av_info *info) {
+    double fps = (core.video_fps > 0) ? core.video_fps : 60.0;
 
-    unsigned w = core.video_width  ? core.video_width  : 1280;
-    unsigned h = core.video_height ? core.video_height : 720;
+    info->geometry.base_width   = core.video_width ? core.video_width : 1280;
+    info->geometry.base_height  = core.video_height ? core.video_height : 720;
+    info->geometry.max_width    = MAX_W;
+    info->geometry.max_height   = MAX_H;
+    info->geometry.aspect_ratio = (float)info->geometry.base_width / info->geometry.base_height;
+    info->timing.fps            = fps;
+    info->timing.sample_rate    = AUDIO_TARGET_RATE;
 
-    info->geometry.base_width   = w;
-    info->geometry.base_height  = h;
-    info->geometry.max_width    = MAX_W;  // Fixed max
-    info->geometry.max_height   = MAX_H;  // Fixed max
-    info->geometry.aspect_ratio = (float)w / (float)h;
-
-    info->timing.fps         = 60.0;
-    info->timing.sample_rate = AUDIO_TARGET_RATE;
+    fprintf(stderr, "[VLC] Reporting AV Info: %ux%u, FPS=%.3f\n",
+            info->geometry.base_width, info->geometry.base_height, fps);
 }
-
 RETRO_API void retro_get_system_info(struct retro_system_info *i) {
     static char library_name[]    = "VLC Media Player";
     static char library_version[] = "1.0";

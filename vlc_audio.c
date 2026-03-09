@@ -3,18 +3,18 @@
 
 static void audio_play(void *data, const void *samples, unsigned count, int64_t pts)
 {
-    (void)data;
-    (void)pts;                     // VLC is the master clock → we ignore PTS
-
-    if (!samples || count == 0 || !audio_batch_cb)
-        return;
-
-    // === THIS IS THE ENTIRE AUDIO PATH NOW ===
-    // No ring buffer. No accumulation. No silence. No mute_frames.
-    // If RetroArch isn't consuming → samples are dropped (correct bridge behavior).
-    audio_batch_cb((const int16_t *)samples, count);
+    (void)data; (void)pts;
+    if (!samples || count == 0 || !audio_batch_cb) return;
+if (core.transitioning) return;
+    const int16_t *buf = (const int16_t *)samples;
+    size_t remaining = count;
+    while (remaining > 0) {
+        size_t written = audio_batch_cb(buf, remaining);
+        if (written == 0) break;   // RetroArch refusing all samples — give up
+        buf       += written * 2;  // stereo, so *2 channels
+        remaining -= written;
+    }
 }
-
 void vlc_audio_setup_callbacks(libvlc_media_player_t *mp)
 {
     libvlc_audio_set_callbacks(mp, audio_play, NULL, NULL, NULL, NULL, NULL);

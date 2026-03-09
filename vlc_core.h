@@ -34,7 +34,8 @@ bool pending_play;
 bool play_start_attempt;     
 int  play_attempt_frames;    
     pthread_mutex_t mutex;
-    
+    bool transitioning;
+	bool video_frame_ready;
     unsigned max_width;
     unsigned max_height;
 	    bool menu_active;        
@@ -53,5 +54,6 @@ void vlc_video_setup_callbacks(libvlc_media_player_t *mp);
 void vlc_audio_setup_callbacks(libvlc_media_player_t *mp);
 bool switch_to_media(const char *path);
 void vlc_menu_draw(void);
+
 
 #endif
