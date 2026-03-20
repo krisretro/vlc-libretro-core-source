@@ -17,7 +17,24 @@
 #if LIBVLC_VERSION_INT >= LIBVLC_VERSION(3,0,0,0)
 LIBVLC_API void libvlc_video_set_mouse_position(libvlc_media_player_t *p_mi, int num, int denom, int x, int y);
 #endif
-
+#ifdef _WIN32
+#include <windows.h>
+static int64_t get_time_us(void)
+{
+    LARGE_INTEGER freq, counter;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&counter);
+    return (counter.QuadPart * 1000000) / freq.QuadPart;
+}
+#else
+#include <time.h>
+static int64_t get_time_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+}
+#endif
 #ifdef _WIN32
 #include <windows.h>
 typedef void (*pfn_libvlc_video_set_mouse_position)(libvlc_media_player_t*, int, int, int, int);
@@ -61,6 +78,8 @@ static bool get_option_enabled(const char *key) {
     return false;
 }
 
+
+
 static libvlc_media_t* create_media(const char *path,
                                     bool *out_is_dvd,
                                     bool *out_is_online,
@@ -79,7 +98,10 @@ static libvlc_media_t* create_media(const char *path,
             is_dvd = true;
     }
 #endif
-
+if (is_dvd && (strcasestr(path, "laserdisc") || strcasestr(path, "(ld)"))) {
+        fprintf(stderr, "[VLC] LaserDisc/File override detected. Disabling DVD mode.\n");
+        is_dvd = false;
+    }
     // --- Read core options ---
     struct retro_variable var = {0};
 
@@ -112,17 +134,26 @@ static libvlc_media_t* create_media(const char *path,
 
     // --- Demux selection (must come before other options that depend on type) ---
     if (core.iptv_menu_enabled == true) {
-		    fprintf(stderr, "[VLC] IPTV MODE ********************************: %s\n", path);
-            libvlc_media_add_option(m, ":codec=avcodec");		   
-		    libvlc_media_add_option(m, ":adaptive-logic=predictive");
-			libvlc_media_add_option(m, ":network-caching=500");
-			libvlc_media_add_option(m, ":live-caching=500");
+		 	libvlc_media_add_option(m, ":avformat");
+		 fprintf(stderr, "[VLC] IPTV MODE ********************************: %s\n", path);
+
+	libvlc_media_add_option(m, ":adaptive-logic=fixedrate");
+//libvlc_media_add_option(m, ":demux=avformat");
+	libvlc_media_add_option(m, ":network-caching=5000");
+libvlc_media_add_option(m, ":live-caching=5000");
+//libvlc_media_add_option(m, ":adaptive-use-access");
 			libvlc_media_add_option(m, ":http-reconnect");
-			libvlc_media_add_option(m, ":avcodec-hw=none");
-			//libvlc_media_add_option(m, ":adaptive-logic=bandwidth");
+		//	libvlc_media_add_option(m, ":live-playback-delay=15000");
+		//	libvlc_media_add_option(m, ":avcodec-hw=none");
+			libvlc_media_add_option(m, ":adaptive-use-access=true");
+libvlc_media_add_option(m, ":adaptive-force=true");
 			libvlc_media_add_option(m, ":adaptive-maxwidth=1920");
 			libvlc_media_add_option(m, ":adaptive-maxheight=1080");
-		libvlc_media_add_option(m, ":clock-jitter=5");
+libvlc_media_add_option(m, ":clock-jitter=0");
+
+//libvlc_media_add_option(m, ":clock-jitter=0");
+//libvlc_media_add_option(m, ":clock-synchro=0");
+//libvlc_media_add_option(m, ":drop-late-frames");
 		//	libvlc_media_add_option(m, ":no-ts-trust-pcr");
     } else if (!is_online) {
         libvlc_media_add_option(m, ":demux=avformat");
@@ -141,9 +172,10 @@ static libvlc_media_t* create_media(const char *path,
 	{
 fprintf(stderr, "DVD MODE\n");    
         fprintf(stderr, "[VLC] DVD MIODE *****************************: %s\n", path);
-	libvlc_media_add_option(m, ":avformat");   /* this is what enables real DVD menus + logos */
-                
-		libvlc_media_add_option(m, ":disc-caching=300");
+	libvlc_media_add_option(m, ":demux=dvdnav");
+              
+	libvlc_media_add_option(m, ":no-dvdsub-transparency");	
+	libvlc_media_add_option(m, ":disc-caching=300");
 		libvlc_media_add_option(m, ":dvdnav");
         libvlc_media_add_option(m, ":no-dvdnav-menu");
         libvlc_media_add_option(m, ":no-dvdnav-mouse-events");
@@ -244,7 +276,10 @@ static bool load_media_file(const char *path) {
     libvlc_media_player_set_media(core.mp, m);
     libvlc_media_release(m);
 
-     core.pending_play = true;
+    /* Flush audio ring and disable output – audio will buffer during startup */
+    vlc_audio_ring_reset();
+
+    core.pending_play = true;
     return true;
 }
 
@@ -366,6 +401,7 @@ RETRO_API void retro_set_environment(retro_environment_t cb) {
         { "vlc_dvd_menu", "DVD menu behavior; normal|force|disable" },
         { "vlc_bluray_menu", "Blu-ray menu behavior; normal|disable" },
         { "vlc_iptv_menu", "IPTV Menu (M3U groups); disabled|enabled" },
+        { "vlc_iptv_resolution", "IPTV output resolution; 1080p|720p|1440p|4K" },
 		{"vlc_ctts_fix", "Aggressive CTTS fix for broken MP4; disabled|enabled" },
 		{ "vlc_spu_enable", "Enable subtitles/overlays; auto|yes|no" },
         { "vlc_spu_track", "Subtitle/SPU track; 0|1|2|3|4|5|6|7|8|9" },
@@ -441,6 +477,10 @@ environ_cb(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &fmt);
      //   "--live-caching=2000",
   //  "--no-audio-time-stretch",
    "--codec=avcodec",
+   "--codec=avcodec",
+"--avcodec-hw=d3d11va",
+    "--avcodec-fast",
+    "--no-drop-late-frames",
     "--http-reconnect",
     "--vout=vmem",
     "--aout=amem"
@@ -524,7 +564,8 @@ environ_cb(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &fmt);
     core.max_width = MAX_W;
     core.max_height = MAX_H;
 	core.pending_play = true;
-	core.transitioning = false;
+	core.stitch_resync_pending = false;
+
 }
 
 static void init_menu_video_buffer(void) {
@@ -581,8 +622,28 @@ if (is_playlist) {
             fprintf(stderr, "[VLC] IPTV menu init failed – falling back to normal playlist\n");
             core.iptv_menu_enabled = false;
         } else {
-            init_menu_video_buffer();   // keeps dark background
+                 init_menu_video_buffer();   // keeps dark background
+                 struct retro_variable res_var = { .key = "vlc_iptv_resolution" };
+    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &res_var) && res_var.value) {
+        if (strcmp(res_var.value, "720p") == 0) {
+            core.iptv_fixed_width = 1280;
+            core.iptv_fixed_height = 720;
+        } else if (strcmp(res_var.value, "1440p") == 0) {
+            core.iptv_fixed_width = 2560;
+            core.iptv_fixed_height = 1440;
+        } else if (strcmp(res_var.value, "4K") == 0) {
+            core.iptv_fixed_width = 3840;
+            core.iptv_fixed_height = 2160;
+        } else { // "1080p" or default
+            core.iptv_fixed_width = 1920;
+            core.iptv_fixed_height = 1080;
         }
+    } else {
+        // Fallback if option not found
+        core.iptv_fixed_width = 1920;
+        core.iptv_fixed_height = 1080;
+    }
+		}
     }
 
     if (!core.iptv_menu_enabled) {
@@ -607,28 +668,30 @@ RETRO_API void retro_run(void)
 {
     input_poll_cb();
 
-    // Read ALL inputs ONCE at the top (this prevents crashes)
-    bool up     = input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_UP);
-    bool down   = input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_DOWN);
-    bool left   = input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_LEFT);
-    bool right  = input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_RIGHT);
-    bool a      = input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_A);
-    bool start  = input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_START);
-    bool select = input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_SELECT);
-    bool l2     = input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_L2);
-    bool r2     = input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_R2);
-    bool x      = input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_X);
+    // 1. Read Inputs (Added L1 and R1)
+    bool up      = input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_UP);
+    bool down    = input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_DOWN);
+    bool left    = input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_LEFT);
+    bool right   = input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_RIGHT);
+   bool l1 = input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_L); // Removed '1'
+bool r1 = input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_R); // Removed '1'
+    bool a       = input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_A);
+    bool start   = input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_START);
+    bool select  = input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_SELECT);
+    bool l2      = input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_L2);
+    bool r2      = input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_R2);
+    bool x       = input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_X);
 
-    // Debounce
+    // 2. Debounce (Added L1 and R1)
     static bool prev_up = false, prev_down = false, prev_left = false, prev_right = false;
+    static bool prev_l1 = false, prev_r1 = false;
     static bool prev_a = false, prev_start = false, prev_select = false;
     static bool prev_l2 = false, prev_r2 = false, prev_x = false;
 
-    // === IPTV MENU MODE (dark background + OSD) ===
+    // === IPTV MENU MODE ===
     if (core.playlist_mode && core.iptv_menu_enabled && core.menu_active) {
-      
         vlc_menu_handle_input();
-        vlc_menu_draw();                     // ← NEW: draws real table
+        vlc_menu_draw();
         video_cb(core.video_buffer, core.video_width, core.video_height, core.video_pitch);
         return;
     }
@@ -637,75 +700,38 @@ RETRO_API void retro_run(void)
 
     // Start playback on first run
     if (core.pending_play) {
-            core.pending_play = false;
-    libvlc_media_player_play(core.mp);
-    core.play_start_attempt = true;      // start monitoring
-    core.play_attempt_frames = 0;        // reset counter
+        core.pending_play = false;
+        libvlc_media_player_play(core.mp);
+        core.play_start_attempt = true;
+        core.play_attempt_frames = 0;
     }
-// === ERROR DETECTION FOR FAILED MEDIA ===
-if (core.play_start_attempt) {
-    libvlc_state_t state = libvlc_media_player_get_state(core.mp);
-    if (state == libvlc_Error || (state == libvlc_Stopped && core.play_attempt_frames > 60)) {
-        // Show message
-        struct retro_message msg = { "Failed to play – bad link?", 180 };
-        environ_cb(RETRO_ENVIRONMENT_SET_MESSAGE, &msg);
 
-        if (core.iptv_menu_enabled && core.playlist_mode) {
-            // Reactivate menu
-            core.menu_active = true;
-            if (core.mp) {
-                libvlc_media_player_stop(core.mp);
-            }
-            init_menu_video_buffer();
-            core.play_start_attempt = false;
-        } else if (core.playlist_mode) {
-            // Auto-skip to next working item
-            int tries = 0;
-            int next_idx = (core.playlist_index + 1) % core.playlist_size;
-            bool switched = false;
-            while (tries < core.playlist_size) {
-                if (switch_to_media(core.playlist[next_idx])) {
-                    core.playlist_index = next_idx;
-                    switched = true;
-                    break;
-                }
-                // If switch fails, try next
-                next_idx = (next_idx + 1) % core.playlist_size;
-                tries++;
-            }
-            if (!switched) {
-                // All items failed – give up and maybe activate menu if possible
-                if (core.iptv_menu_enabled) {
-                    core.menu_active = true;
-                    init_menu_video_buffer();
-                } else {
-                    // Just show error and stay
-                    struct retro_message msg2 = { "All links failed", 180 };
-                    environ_cb(RETRO_ENVIRONMENT_SET_MESSAGE, &msg2);
-                }
-            }
-            core.play_start_attempt = false; // will be set again by pending_play if switched
-        } else {
-            // Single file mode – just show error
+    // === ERROR DETECTION ===
+    if (core.play_start_attempt) {
+        libvlc_state_t state = libvlc_media_player_get_state(core.mp);
+        if (state == libvlc_Error || (state == libvlc_Stopped && core.play_attempt_frames > 60)) {
+            struct retro_message msg = { "Failed to play – bad link?", 180 };
+            environ_cb(RETRO_ENVIRONMENT_SET_MESSAGE, &msg);
+           
+        } else if (state == libvlc_Playing) {
             core.play_start_attempt = false;
         }
-    } else if (state == libvlc_Playing) {
-        core.play_start_attempt = false;
+        core.play_attempt_frames++;
     }
-    core.play_attempt_frames++;
-}
+
     // === SELECT = Toggle Menu ===
     if (select && !prev_select && core.playlist_mode && core.iptv_menu_enabled) {
-    core.menu_active = !core.menu_active;
-    if (core.menu_active) {
-        if (core.mp) {
-            libvlc_media_player_stop(core.mp);
+        core.menu_active = !core.menu_active;
+        if (core.menu_active) {
+            if (core.mp) libvlc_media_player_stop(core.mp);
+            init_menu_video_buffer();
+        } else {
+            core.pending_play = true;
         }
-        init_menu_video_buffer();   // ensure menu buffer is ready
-    } else {
-        core.pending_play = true;
     }
-}
+
+
+
 
     // === START = Pause/Play ===
     if (start && !prev_start) {
@@ -713,23 +739,23 @@ if (core.play_start_attempt) {
         libvlc_media_player_set_pause(core.mp, core.paused ? 1 : 0);
     }
 
-    // === UP/DOWN = Channel Zapping while playing ===
+    // === UP/DOWN = Channel Zapping ===
     if (core.playlist_mode && !core.menu_active) {
-    if (up && !prev_up) {
-        int new_idx = (core.playlist_index - 1 + core.playlist_size) % core.playlist_size;
-        if (switch_to_media(core.playlist[new_idx])) core.playlist_index = new_idx;
+        if (up && !prev_up) {
+            int new_idx = (core.playlist_index - 1 + core.playlist_size) % core.playlist_size;
+            if (switch_to_media(core.playlist[new_idx])) core.playlist_index = new_idx;
+        }
+        if (down && !prev_down) {
+            int new_idx = (core.playlist_index + 1) % core.playlist_size;
+            if (switch_to_media(core.playlist[new_idx])) core.playlist_index = new_idx;
+        }
     }
-    if (down && !prev_down) {
-        int new_idx = (core.playlist_index + 1) % core.playlist_size;
-        if (switch_to_media(core.playlist[new_idx])) core.playlist_index = new_idx;
-    }
-}
 
     // === UPDATE PLAYING STATE ===
     libvlc_state_t state = libvlc_media_player_get_state(core.mp);
     core.is_playing = (state == libvlc_Playing);
 
-    // === X BUTTON PAUSE (backup) ===
+    // === X BUTTON PAUSE ===
     if (x && !prev_x) {
         core.paused = !core.paused;
         libvlc_media_player_set_pause(core.mp, core.paused ? 1 : 0);
@@ -737,28 +763,31 @@ if (core.play_start_attempt) {
 
     if (core.paused) {
         pthread_mutex_lock(&core.mutex);
-        if (video_cb && core.video_buffer && core.video_width && core.video_height) {
+        if (video_cb && core.video_buffer && core.video_width && core.video_height)
             video_cb(core.video_buffer, core.video_width, core.video_height, core.video_pitch);
-        }
         pthread_mutex_unlock(&core.mutex);
         goto end_inputs;
     }
 
-    // === DVD NAVIGATION + SEEK (Left/Right) ===
-    if (core.is_playing) {
-        if (up && !prev_up)    libvlc_media_player_navigate(core.mp, libvlc_navigate_up);
-        if (down && !prev_down) libvlc_media_player_navigate(core.mp, libvlc_navigate_down);
-        if (a && !prev_a)      libvlc_media_player_navigate(core.mp, libvlc_navigate_activate);
+   // === DVD NAVIGATION + SEEK ===
+    if (core.mp && core.is_playing) {
+        // Up/Down/Left/Right used for DVD Menu Navigation
+        if (up && !prev_up)       libvlc_media_player_navigate(core.mp, libvlc_navigate_up);
+        if (down && !prev_down)   libvlc_media_player_navigate(core.mp, libvlc_navigate_down);
+        if (left && !prev_left)   libvlc_media_player_navigate(core.mp, libvlc_navigate_left);
+        if (right && !prev_right) libvlc_media_player_navigate(core.mp, libvlc_navigate_right);
+        if (a && !prev_a)         libvlc_media_player_navigate(core.mp, libvlc_navigate_activate);
 
-        if (left && !prev_left) {
+        // L1 / R1 used for Seeking back and forth
+        if (l1 && !prev_l1) {
             int64_t t = libvlc_media_player_get_time(core.mp);
-            libvlc_media_player_set_time(core.mp, t - 10000);
+            libvlc_media_player_set_time(core.mp, t - 10000); // Back 10s
             struct retro_message msg = { "Seek ← 10s", 150 };
             environ_cb(RETRO_ENVIRONMENT_SET_MESSAGE, &msg);
         }
-        if (right && !prev_right) {
+        if (r1 && !prev_r1) {
             int64_t t = libvlc_media_player_get_time(core.mp);
-            libvlc_media_player_set_time(core.mp, t + 10000);
+            libvlc_media_player_set_time(core.mp, t + 10000); // Forward 10s
             struct retro_message msg = { "Seek → 10s", 150 };
             environ_cb(RETRO_ENVIRONMENT_SET_MESSAGE, &msg);
         }
@@ -771,18 +800,19 @@ if (core.play_start_attempt) {
         if (r2 && !prev_r2) new_index = (core.playlist_index + 1) % core.playlist_size;
 
         if (new_index != core.playlist_index) {
-            if (switch_to_media(core.playlist[new_index])) {
+            if (switch_to_media(core.playlist[new_index]))
                 core.playlist_index = new_index;
-            }
         }
     }
 
 end_inputs:
-    // Update debounce
+   // Update debounce (ensure l1/r1 are included here)
     prev_up     = up;
     prev_down   = down;
     prev_left   = left;
     prev_right  = right;
+    prev_l1     = l1;
+    prev_r1     = r1;
     prev_a      = a;
     prev_start  = start;
     prev_select = select;
@@ -790,12 +820,34 @@ end_inputs:
     prev_r2     = r2;
     prev_x      = x;
 
-    // === VIDEO OUTPUT ===
-   pthread_mutex_lock(&core.mutex);
-if (video_cb && core.video_buffer && core.video_width && core.video_height) {
-    video_cb(core.video_buffer, core.video_width, core.video_height, core.video_pitch);
-}
-pthread_mutex_unlock(&core.mutex);
+  // === VIDEO OUTPUT ===
+    if (!core.menu_active) {
+        const uint32_t *vbuf;
+        unsigned vw, vh, vpitch;
+        if (vlc_video_get_frame(&vbuf, &vw, &vh, &vpitch))
+            video_cb(vbuf, vw, vh, vpitch);
+		 	if (vlc_video_consume_pending_release(0)) {
+     
+        vlc_audio_sync_and_enable(0);
+  
+		
+    }
+    } else {
+        pthread_mutex_lock(&core.mutex);
+        if (core.video_buffer && core.video_width && core.video_height)
+            video_cb(core.video_buffer, core.video_width, core.video_height, core.video_pitch);
+       
+		pthread_mutex_unlock(&core.mutex);
+    }
+
+
+    // === AUDIO OUTPUT every frame ===
+    if (audio_batch_cb) {
+        static int16_t audio_frame[SAMPLES_PER_FRAME * 2];
+        vlc_audio_ring_read(audio_frame, SAMPLES_PER_FRAME);
+        audio_batch_cb(audio_frame, SAMPLES_PER_FRAME);
+	
+    }
 }
 
 RETRO_API void retro_get_system_av_info(struct retro_system_av_info *info) {
