@@ -4,16 +4,26 @@
 #include <ctype.h>
 #include "vlc_core.h"
 #include "libretro.h"
-#define FONT_SCALE 2   // Makes text 16x16 pixels (adjust as needed)
 
-#define VISIBLE_ITEMS 22   // Number of items visible at once (adjust for your line spacing)
+#ifdef _WIN32
+#include <windows.h>
+#include <wininet.h>
+#else
+#include <curl/curl.h>
+#endif
+
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
+
+#define FONT_SCALE 2
+#define VISIBLE_ITEMS 22
+
 extern retro_input_state_t input_state_cb;
 
 // Forward declaration
 static void build_current_group_items(void);
 
-
-// 8x8 bitmap font (standard in many cores)
+// 8x8 bitmap font (unchanged)
 static const uint8_t font8x8[96][8] = {
     {0,0,0,0,0,0,0,0}, {0x18,0x3C,0x3C,0x18,0x18,0x0,0x18,0x0}, {0x6C,0x6C,0x6C,0x0,0x0,0x0,0x0,0x0}, {0x6C,0x6C,0xFE,0x6C,0xFE,0x6C,0x6C,0x0},
     {0x18,0x7E,0xC0,0x7C,0x6,0xFC,0x18,0x0}, {0x0,0xC6,0xCC,0x18,0x30,0x66,0xC6,0x0}, {0x38,0x6C,0x38,0x76,0xDC,0xCC,0x76,0x0}, {0x18,0x18,0x30,0x0,0x0,0x0,0x0,0x0},
@@ -45,7 +55,9 @@ typedef struct {
     char *title;
     char *path;
     char *group;
-    char *logo;          // ← NEW: tvg-logo support
+    char *logo;
+    uint32_t *logo_data;
+    int logo_w, logo_h;
 } playlist_item_t;
 
 static playlist_item_t *all_items = NULL;
@@ -54,12 +66,30 @@ static int total_items = 0;
 static char **groups = NULL;
 static int group_count = 0;
 
-static playlist_item_t *current_group_items = NULL;
+static playlist_item_t **current_group_items = NULL;
 static int current_group_item_count = 0;
 
 static int current_group_idx = 0;
 static int current_selection = 0;
 static bool in_submenu = false;
+
+#ifndef _WIN32
+struct curl_data {
+    uint8_t *data;
+    size_t size;
+};
+
+static size_t curl_write_cb(void *ptr, size_t size, size_t nmemb, void *userp) {
+    struct curl_data *chunk = (struct curl_data*)userp;
+    size_t realsize = size * nmemb;
+    uint8_t *p = (uint8_t*)realloc(chunk->data, chunk->size + realsize);
+    if (!p) return 0;
+    chunk->data = p;
+    memcpy(&(chunk->data[chunk->size]), ptr, realsize);
+    chunk->size += realsize;
+    return realsize;
+}
+#endif
 
 static void free_menu_data(void) {
     for (int i = 0; i < total_items; i++) {
@@ -67,6 +97,7 @@ static void free_menu_data(void) {
         free(all_items[i].path);
         free(all_items[i].group);
         free(all_items[i].logo);
+        if (all_items[i].logo_data) free(all_items[i].logo_data);
     }
     free(all_items);
     for (int i = 0; i < group_count; i++) free(groups[i]);
@@ -108,6 +139,7 @@ bool vlc_menu_init(const char *m3u_path) {
     char line[4096];
     char current_group[256] = "Ungrouped";
     char current_title[256] = "Unknown";
+    char *current_logo_url = NULL;
 
     int capacity = 64;
     all_items = malloc(capacity * sizeof(playlist_item_t));
@@ -122,27 +154,31 @@ bool vlc_menu_init(const char *m3u_path) {
             if (group_start) {
                 group_start += 13;
                 char *end = strchr(group_start, '"');
-               if (end) {
-    size_t len = end - group_start;
-    if (len >= sizeof(current_group)) len = sizeof(current_group) - 1;
-    memcpy(current_group, group_start, len);
-    current_group[len] = '\0';
-}
+                if (end) {
+                    size_t len = end - group_start;
+                    if (len >= sizeof(current_group)) len = sizeof(current_group) - 1;
+                    memcpy(current_group, group_start, len);
+                    current_group[len] = '\0';
+                }
             }
             char *title = extract_title(p);
             snprintf(current_title, sizeof(current_title), "%s", title);
             free(title);
+
+            if (current_logo_url) free(current_logo_url);
+            current_logo_url = extract_field(p, "tvg-logo=\"");
+            if (!current_logo_url) current_logo_url = strdup("");
         } 
         else if (*p != '#') {
-            // path + logo parsing
             char full[4096];
-            if (strstr(p, "://")) snprintf(full, sizeof(full), "%s", p);
-            else {
+            if (strstr(p, "://")) {
+                snprintf(full, sizeof(full), "%s", p);
+            } else {
                 char basedir[4096] = {0};
                 snprintf(basedir, sizeof(basedir), "%s", m3u_path);
-char *slash = strrchr(basedir, '/');
-if (slash) *(slash+1) = '\0';
-else basedir[0] = '\0';
+                char *slash = strrchr(basedir, '/');
+                if (slash) *(slash+1) = '\0';
+                snprintf(full, sizeof(full), "%s%s", basedir, p);
             }
             char *nl = strchr(full, '\n'); if (nl) *nl = '\0';
 
@@ -154,18 +190,19 @@ else basedir[0] = '\0';
             it->title = strdup(current_title);
             it->path  = strdup(full);
             it->group = strdup(current_group);
-            it->logo  = extract_field(line, "tvg-logo=\"");   // ← parsed!
-            if (!it->logo) it->logo = strdup("");
+            it->logo  = strdup(current_logo_url);
+            it->logo_data = NULL;
+            it->logo_w = it->logo_h = 0;
         }
     }
     fclose(f);
+    if (current_logo_url) { free(current_logo_url); current_logo_url = NULL; }
 
     if (total_items == 0) {
         free_menu_data();
         return false;
     }
 
-    // Redirect detection (unchanged)
     if (total_items == 1 && strstr(all_items[0].path, "://")) {
         const char *p = all_items[0].path;
         if (strcasecmp(p + strlen(p) - 4, ".m3u") == 0 || strcasecmp(p + strlen(p) - 5, ".m3u8") == 0) {
@@ -175,7 +212,6 @@ else basedir[0] = '\0';
         }
     }
 
-    // Build groups (unchanged)
     groups = malloc(total_items * sizeof(char*));
     group_count = 0;
     for (int i = 0; i < total_items; i++) {
@@ -186,6 +222,10 @@ else basedir[0] = '\0';
         if (!exists) groups[group_count++] = strdup(all_items[i].group);
     }
 
+#ifndef _WIN32
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+#endif
+
     core.menu_active = true;
     in_submenu = false;
     current_selection = 0;
@@ -194,7 +234,6 @@ else basedir[0] = '\0';
 }
 
 static void build_current_group_items(void) {
-    // Free previous items (pointers only, not the data itself)
     if (current_group_items) {
         free(current_group_items);
         current_group_items = NULL;
@@ -202,25 +241,21 @@ static void build_current_group_items(void) {
     current_group_item_count = 0;
 
     const char *gname = groups[current_group_idx];
-    // Count items in this group
-    for (int i = 0; i < total_items; i++) {
+    for (int i = 0; i < total_items; i++)
         if (strcmp(all_items[i].group, gname) == 0)
             current_group_item_count++;
-    }
+
     if (current_group_item_count == 0) return;
 
-    // Allocate array of pointers (no deep copy)
-    current_group_items = malloc(current_group_item_count * sizeof(playlist_item_t));
+    current_group_items = malloc(current_group_item_count * sizeof(playlist_item_t*));
     int idx = 0;
     for (int i = 0; i < total_items; i++) {
-        if (strcmp(all_items[i].group, gname) == 0) {
-            current_group_items[idx++] = all_items[i];
-        }
+        if (strcmp(all_items[i].group, gname) == 0)
+            current_group_items[idx++] = &all_items[i];
     }
 }
 
 void vlc_menu_handle_input(void) {
-    // (input logic exactly as before – no change)
     bool up    = input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_UP);
     bool down  = input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_DOWN);
     bool a     = input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_A);
@@ -241,9 +276,13 @@ void vlc_menu_handle_input(void) {
             in_submenu = true;
             current_selection = 0;
         } else {
-            core.menu_active = false;
-            switch_to_media(current_group_items[current_selection].path);
-        }
+            
+            vlc_audio_ring_reset();
+			core.menu_active = false;
+			core.exit_menu = true;
+			strncpy(current_channel_path, current_group_items[current_selection]->path, MAX_PATH - 1);
+			switch_to_media(current_group_items[current_selection]->path);
+		}
     }
 
     if (b && !prev_b && in_submenu) {
@@ -256,31 +295,114 @@ void vlc_menu_handle_input(void) {
     prev_up = up; prev_down = down; prev_a = a; prev_b = b;
 }
 
-// ==================== GRAPHICAL DRAWING ====================
+// ==================== LOGO LOADING ====================
+
+static void load_logo(playlist_item_t *it) {
+    if (!it || !it->logo || !it->logo[0] || it->logo_data) return;
+
+    uint8_t *file_data = NULL;
+    int file_size = 0;
+
+    if (strstr(it->logo, "://")) {
+#ifdef _WIN32
+        HINTERNET hInet = InternetOpenA("RetroArch-VLC", INTERNET_OPEN_TYPE_DIRECT, NULL, NULL, 0);
+        if (hInet) {
+            DWORD flags = INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE;
+            if (strstr(it->logo, "https://")) flags |= INTERNET_FLAG_SECURE;
+            HINTERNET hUrl = InternetOpenUrlA(hInet, it->logo, NULL, 0, flags, 0);
+            if (hUrl) {
+                char buf[8192];
+                DWORD read;
+                while (InternetReadFile(hUrl, buf, sizeof(buf), &read) && read > 0) {
+                    uint8_t *tmp = realloc(file_data, file_size + read);
+                    if (!tmp) break;
+                    file_data = tmp;
+                    memcpy(file_data + file_size, buf, read);
+                    file_size += read;
+                }
+                InternetCloseHandle(hUrl);
+            }
+            InternetCloseHandle(hInet);
+        }
+#else
+        CURL *curl = curl_easy_init();
+        if (curl) {
+            struct curl_data chunk = {0};
+            curl_easy_setopt(curl, CURLOPT_URL, it->logo);
+            curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_cb);
+            curl_easy_setopt(curl, CURLOPT_WRITEDATA, &chunk);
+            curl_easy_setopt(curl, CURLOPT_TIMEOUT, 5L);
+            curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+            if (curl_easy_perform(curl) == CURLE_OK) {
+                long code = 0;
+                curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+                if (code == 200) {
+                    file_data = chunk.data;
+                    file_size = (int)chunk.size;
+                } else {
+                    free(chunk.data);
+                }
+            } else {
+                free(chunk.data);
+            }
+            curl_easy_cleanup(curl);
+        }
+#endif
+    } else {
+        int w, h, ch;
+        uint8_t *rgba = stbi_load(it->logo, &w, &h, &ch, 4);
+        if (rgba) {
+            it->logo_data = (uint32_t*)malloc(w * h * sizeof(uint32_t));
+            it->logo_w = w;
+            it->logo_h = h;
+            for (int i = 0; i < w * h; i++) {
+                uint8_t *p = rgba + i * 4;
+                it->logo_data[i] = (p[3] << 24) | (p[0] << 16) | (p[1] << 8) | p[2];
+            }
+            stbi_image_free(rgba);
+            return;
+        }
+    }
+
+    if (file_size > 0 && file_data) {
+        int w, h, ch;
+        uint8_t *rgba = stbi_load_from_memory(file_data, file_size, &w, &h, &ch, 4);
+        if (rgba) {
+            it->logo_data = (uint32_t*)malloc(w * h * sizeof(uint32_t));
+            it->logo_w = w;
+            it->logo_h = h;
+            for (int i = 0; i < w * h; i++) {
+                uint8_t *p = rgba + i * 4;
+                it->logo_data[i] = (p[3] << 24) | (p[0] << 16) | (p[1] << 8) | p[2];
+            }
+            stbi_image_free(rgba);
+        }
+        free(file_data);
+    }
+}
+
+// ==================== DRAWING ====================
 
 static void draw_pixel(uint32_t *buf, unsigned pitch, int x, int y, uint32_t color) {
     if (x < 0 || y < 0 || x >= 1280 || y >= 720) return;
     buf[y * (pitch/4) + x] = color;
 }
+
 static void draw_filled_rect(uint32_t *buf, unsigned pitch, int x, int y, int w, int h, uint32_t color) {
-    for (int row = 0; row < h; row++) {
-        for (int col = 0; col < w; col++) {
+    for (int row = 0; row < h; row++)
+        for (int col = 0; col < w; col++)
             draw_pixel(buf, pitch, x + col, y + row, color);
-        }
-    }
 }
+
 static void draw_char(uint32_t *buf, unsigned pitch, int x, int y, char c, uint32_t color) {
     if (c < 32 || c > 127) c = ' ';
     const uint8_t *glyph = font8x8[c - 32];
     for (int py = 0; py < 8; py++) {
         for (int px = 0; px < 8; px++) {
-            if (glyph[py] & (1 << (7-px))) {
-                // Draw a block of FONT_SCALE x FONT_SCALE pixels
-                for (int dy = 0; dy < FONT_SCALE; dy++) {
-                    for (int dx = 0; dx < FONT_SCALE; dx++) {
-                        draw_pixel(buf, pitch, x + px*FONT_SCALE + dx, y + py*FONT_SCALE + dy, color);
-                    }
-                }
+            if (glyph[py] & (1 << (7 - px))) {
+                for (int dy = 0; dy < FONT_SCALE; dy++)
+                    for (int dx = 0; dx < FONT_SCALE; dx++)
+                        draw_pixel(buf, pitch, x + px * FONT_SCALE + dx, y + py * FONT_SCALE + dy, color);
             }
         }
     }
@@ -293,7 +415,27 @@ static void draw_string(uint32_t *buf, unsigned pitch, int x, int y, const char 
     }
 }
 
+// Big logo drawer (right side of screen)
+static void draw_big_logo(uint32_t *buf, unsigned pitch, int x, int y, const uint32_t *data, int src_w, int src_h) {
+    if (!data || src_w <= 0 || src_h <= 0) return;
 
+    int target_h = 300;
+    int target_w = (src_w * target_h) / src_h;
+
+    if (target_w > 520) {               // keep it inside the right black area
+        target_w = 520;
+        target_h = (src_h * target_w) / src_w;
+    }
+    if (target_w < 1 || target_h < 1) return;
+
+    for (int ty = 0; ty < target_h; ty++) {
+        int sy = (ty * src_h) / target_h;
+        for (int tx = 0; tx < target_w; tx++) {
+            int sx = (tx * src_w) / target_w;
+            draw_pixel(buf, pitch, x + tx, y + ty, data[sy * src_w + sx]);
+        }
+    }
+}
 
 void vlc_menu_draw(void) {
     pthread_mutex_lock(&core.mutex);
@@ -305,64 +447,78 @@ void vlc_menu_draw(void) {
     uint32_t *buf = core.video_buffer;
     unsigned pitch = core.video_pitch;
 
-    // Dark background
+    // Full dark background
     for (size_t i = 0; i < (pitch/4) * core.video_height; i++) buf[i] = 0xFF1A1A1A;
 
     // Header
     draw_string(buf, pitch, 40, 40, "IPTV MENU", 0xFFFFFFFF);
 
-   if (!in_submenu) {
-    draw_string(buf, pitch, 40, 80, "Select Group", 0xFFAAAAAA);
-    // Calculate visible range
-    int start = current_selection - VISIBLE_ITEMS / 2;
-    if (start < 0) start = 0;
-    if (start + VISIBLE_ITEMS > group_count)
-        start = group_count - VISIBLE_ITEMS;
-    if (start < 0) start = 0;   // when group_count < VISIBLE_ITEMS
+    if (!in_submenu) {
+        draw_string(buf, pitch, 40, 80, "Select Group", 0xFFAAAAAA);
+        int start = current_selection - VISIBLE_ITEMS / 2;
+        if (start < 0) start = 0;
+        if (start + VISIBLE_ITEMS > group_count) start = group_count - VISIBLE_ITEMS;
+        if (start < 0) start = 0;
 
-for (int i = 0; i < VISIBLE_ITEMS && (start + i) < group_count; i++) {
-    int idx = start + i;
-    int y = 120 + i * 24;
-    // Clear the whole line area (from left margin to right edge)
-    draw_filled_rect(buf, pitch, 40, y, 1200, 16, 0xFF1A1A1A);
-    draw_string(buf, pitch, 60, y, groups[idx], (idx == current_selection) ? 0xFFFF0000 : 0xFFFFFFFF);
-    if (idx == current_selection)
-        draw_string(buf, pitch, 40, y, "→", 0xFFFF0000);
-}
-} else {
-    draw_string(buf, pitch, 40, 80, "Channels in group:", 0xFFAAAAAA);
-    char header[128];
-    snprintf(header, sizeof(header), "Group: %s", groups[current_group_idx]);
-    draw_string(buf, pitch, 40, 100, header, 0xFF00FF00);
+        for (int i = 0; i < VISIBLE_ITEMS && (start + i) < group_count; i++) {
+            int idx = start + i;
+            int y = 120 + i * 24;
+            draw_filled_rect(buf, pitch, 40, y, 1200, 16, 0xFF1A1A1A);
+            draw_string(buf, pitch, 60, y, groups[idx], (idx == current_selection) ? 0xFFFF0000 : 0xFFFFFFFF);
+            if (idx == current_selection)
+                draw_string(buf, pitch, 40, y, "→", 0xFFFF0000);
+        }
+    } else {
+        draw_string(buf, pitch, 40, 80, "Channels in group:", 0xFFAAAAAA);
+        char header[128];
+        snprintf(header, sizeof(header), "Group: %s", groups[current_group_idx]);
+        draw_string(buf, pitch, 40, 100, header, 0xFF00FF00);
 
-    // Visible range
-    int start = current_selection - VISIBLE_ITEMS / 2;
-    if (start < 0) start = 0;
-    if (start + VISIBLE_ITEMS > current_group_item_count)
-        start = current_group_item_count - VISIBLE_ITEMS;
-    if (start < 0) start = 0;
+        // Load ONLY the currently highlighted channel's logo (cached after first time)
+        if (current_group_item_count > 0) {
+            load_logo(current_group_items[current_selection]);
+        }
 
-    for (int i = 0; i < VISIBLE_ITEMS && (start + i) < current_group_item_count; i++) {
-    int idx = start + i;
-    int y = 140 + i * 24;
-    // Clear the line
-    draw_filled_rect(buf, pitch, 40, y, 1200, 16, 0xFF1A1A1A);
-    char line[256];
-    snprintf(line, sizeof(line), "%s%s",
-             (idx == current_selection) ? "→ " : "  ",
-             current_group_items[idx].title);
-    draw_string(buf, pitch, 60, y, line, (idx == current_selection) ? 0xFFFF0000 : 0xFFFFFFFF);
-    if (current_group_items[idx].logo && current_group_items[idx].logo[0]) {
-        draw_string(buf, pitch, 400, y, "[LOGO]", 0xFF00AAFF);
+        // List of channels (no small logos anymore)
+        int start = current_selection - VISIBLE_ITEMS / 2;
+        if (start < 0) start = 0;
+        if (start + VISIBLE_ITEMS > current_group_item_count)
+            start = current_group_item_count - VISIBLE_ITEMS;
+        if (start < 0) start = 0;
+
+        for (int i = 0; i < VISIBLE_ITEMS && (start + i) < current_group_item_count; i++) {
+            int idx = start + i;
+            int y = 140 + i * 24;
+
+            draw_filled_rect(buf, pitch, 40, y, 1200, 16, 0xFF1A1A1A);
+
+            char line[256];
+            snprintf(line, sizeof(line), "%s%s",
+                     (idx == current_selection) ? "→ " : "  ",
+                     current_group_items[idx]->title);
+            draw_string(buf, pitch, 60, y, line, (idx == current_selection) ? 0xFFFF0000 : 0xFFFFFFFF);
+        }
+
+        // BIG LOGO IN THE BLACK SPACE ON THE RIGHT (only for highlighted channel)
+        if (current_group_item_count > 0) {
+            playlist_item_t *sel = current_group_items[current_selection];
+            if (sel->logo_data) {
+                draw_string(buf, pitch, 680, 140, "Channel Logo:", 0xFF00AAFF);
+                draw_big_logo(buf, pitch, 680, 180,
+                              sel->logo_data, sel->logo_w, sel->logo_h);
+            }
+        }
     }
-}
-}
 
     // Bottom bar
     draw_string(buf, pitch, 40, 680, "Select=Close Menu   A=Play   B=Back   Up/Down=Navigate", 0xFF888888);
 
     pthread_mutex_unlock(&core.mutex);
 }
+
 void vlc_menu_deinit(void) {
+#ifndef _WIN32
+    curl_global_cleanup();
+#endif
     free_menu_data();
 }

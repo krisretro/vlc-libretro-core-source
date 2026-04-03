@@ -9,6 +9,7 @@
 #include "libretro.h"
 #include <vlc/libvlc_version.h>
 #ifdef _WIN32
+char current_channel_path[MAX_PATH] = {0};
 #include <windows.h>
 #else
 #include <unistd.h>
@@ -78,7 +79,51 @@ static bool get_option_enabled(const char *key) {
     return false;
 }
 
+// The event callback function
+// The event callback function
+static void vlc_event_cb(const struct libvlc_event_t *ev, void *data) {
+    if (!core.iptv_menu_enabled)
+        return;
 
+    if (ev->type == libvlc_MediaPlayerESDeleted) {
+        pthread_mutex_lock(&core.mutex);
+
+        // 1. Time-based suppression window (absorbs the cascade of Video/Audio/Sub ESDeleted events)
+        if (core.suppress_stitch_until_us > 0 && get_time_us() < core.suppress_stitch_until_us) {
+            fprintf(stderr, "[VLC-CORE] Suppressed ESDeleted (within seek window)\n");
+            pthread_mutex_unlock(&core.mutex);
+            return;
+        }
+
+        /* Suppress the ESDeleted caused by the initial-load set_time hack */
+        if (core.initial_load || core.stitch_seek_pending) {
+            core.stitch_seek_pending = false;
+            core.initial_load = false; // Clear this so it doesn't stay true forever
+            core.stitch_resync_pending = true;
+            
+            // Activate a 1-second shield to absorb the remaining ESDeleted events
+            core.suppress_stitch_until_us = get_time_us() + 1000000; 
+
+            fprintf(stderr, "[VLC-CORE] Suppressed initial-load ESDeleted (sync hack)\n");
+            pthread_mutex_unlock(&core.mutex);
+            return;
+        }
+        
+        // Only trigger if the menu is *not active* and we're not doing a normal switch
+        if (!core.menu_active && core.expect_ad_break_switch) {
+            core.true_discontinuity_pending = true;
+            core.stitch_resync_pending      = true;
+            core.stitch_switch_pending      = true;
+
+            // 2. THE MISSING LINE: Actually reset the flag!
+            core.expect_ad_break_switch = false;
+
+            fprintf(stderr, "[VLC-CORE] Hard Discontinuity Triggered (Ad/Prog Switch)\n");
+        }
+
+        pthread_mutex_unlock(&core.mutex);
+    }
+}
 
 static libvlc_media_t* create_media(const char *path,
                                     bool *out_is_dvd,
@@ -144,7 +189,7 @@ libvlc_media_add_option(m, ":live-caching=5000");
 //libvlc_media_add_option(m, ":adaptive-use-access");
 			libvlc_media_add_option(m, ":http-reconnect");
 		//	libvlc_media_add_option(m, ":live-playback-delay=15000");
-		//	libvlc_media_add_option(m, ":avcodec-hw=none");
+			libvlc_media_add_option(m, ":avcodec-hw=none");
 			libvlc_media_add_option(m, ":adaptive-use-access=true");
 libvlc_media_add_option(m, ":adaptive-force=true");
 			libvlc_media_add_option(m, ":adaptive-maxwidth=1920");
@@ -209,15 +254,15 @@ fprintf(stderr, "DVD MODE\n");
 bool switch_to_media(const char *path) {
     fprintf(stderr, "[VLC] Switching to playlist item: %s\n", path);
 
-    // Create player on first use (critical for IPTV menu mode)
     if (!core.mp) {
         core.mp = libvlc_media_player_new(core.libvlc);
         if (!core.mp) return false;
         vlc_video_setup_callbacks(core.mp);
         vlc_audio_setup_callbacks(core.mp);
+		libvlc_event_manager_t *em = libvlc_media_player_event_manager(core.mp);
+libvlc_event_attach(em, libvlc_MediaPlayerESDeleted, vlc_event_cb, NULL);
     }
 
-    // Stop current playback safely
     libvlc_media_player_stop(core.mp);
     int waited = 0;
     while (libvlc_media_player_get_state(core.mp) != libvlc_Stopped && waited < 150) {
@@ -229,25 +274,28 @@ bool switch_to_media(const char *path) {
         waited++;
     }
 
-    // Clear old buffer (new media will re-allocate via format callback)
-   pthread_mutex_lock(&core.mutex);
-if (!core.menu_active) {
-    free(core.video_buffer);
-    core.video_buffer = NULL;
-}
-core.video_width = core.video_height = 0;
-pthread_mutex_unlock(&core.mutex);
+    // === ONLY free the MENU buffer (we no longer zero video width) ===
+    pthread_mutex_lock(&core.mutex);
+    if (!core.menu_active) {
+        free(core.video_buffer);
+        core.video_buffer = NULL;
+    }
+    // REMOVED: core.video_width = core.video_height = 0;  ← this was the bug
+    pthread_mutex_unlock(&core.mutex);
 
-    // Create and switch media
     bool is_dvd, is_online, is_bluray;
     libvlc_media_t *m = create_media(path, &is_dvd, &is_online, &is_bluray);
     if (!m) {
         fprintf(stderr, "[VLC] Failed to create media for %s\n", path);
         return false;
     }
-
+    // === FORCE resync gate immediately (works for both initial and stitches) ===
+   
+  
     libvlc_media_player_set_media(core.mp, m);
     libvlc_media_release(m);
+
+
     core.pending_play = true;
 
     return true;
@@ -266,7 +314,8 @@ static bool load_media_file(const char *path) {
 
     vlc_video_setup_callbacks(core.mp);
     vlc_audio_setup_callbacks(core.mp);
-
+libvlc_event_manager_t *em = libvlc_media_player_event_manager(core.mp);
+libvlc_event_attach(em, libvlc_MediaPlayerESDeleted, vlc_event_cb, NULL);
     libvlc_media_t *m = create_media(path, NULL, NULL, NULL);
     if (!m) {
         fprintf(stderr, "[VLC] Failed to create media\n");
@@ -275,11 +324,7 @@ static bool load_media_file(const char *path) {
 
     libvlc_media_player_set_media(core.mp, m);
     libvlc_media_release(m);
-
-    /* Flush audio ring and disable output – audio will buffer during startup */
-    vlc_audio_ring_reset();
-
-    core.pending_play = true;
+ core.pending_play = true;
     return true;
 }
 
@@ -476,10 +521,10 @@ environ_cb(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &fmt);
         "--file-caching=1000",
      //   "--live-caching=2000",
   //  "--no-audio-time-stretch",
-   "--codec=avcodec",
-   "--codec=avcodec",
-"--avcodec-hw=d3d11va",
-    "--avcodec-fast",
+ //  "--codec=avcodec",
+ //  "--codec=avcodec",
+//"--avcodec-hw=d3d11va",
+  //  "--avcodec-fast",
     "--no-drop-late-frames",
     "--http-reconnect",
     "--vout=vmem",
@@ -563,9 +608,15 @@ environ_cb(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &fmt);
     core.video_pitch = 0;
     core.max_width = MAX_W;
     core.max_height = MAX_H;
-	core.pending_play = true;
+	core.pending_play = false;
 	core.stitch_resync_pending = false;
-
+core.stitch_seek_pending = false;
+core.exit_menu = false;
+core.last_video_frame_time = 0;
+core.last_time = -1;
+core.video_frame_seen = false;
+core.initial_load = false;
+core.true_discontinuity_pending = false;
 }
 
 static void init_menu_video_buffer(void) {
@@ -664,6 +715,52 @@ if (is_playlist) {
     return true;
 }
 
+/*
+ * vlc_stitch_try_commit
+ *
+ * Called every frame while a dual-buffer stitch is in flight.
+ *
+ * Strategy:
+ *   Fill buf B (staging) with new audio+video while buf A (old) drains.
+ *   Once buf A's audio ring is empty — meaning every sample from the old
+ *   stream has been sent to the frontend — flip both audio and video read
+ *   pointers to buf B.  The old buf A is then reset and becomes the next
+ *   staging buffer on the following stitch.
+ *
+ * Audio is the authoritative drain signal because it is continuous: even if
+ * there are no more ready video frames in the old buffer, audio may still have
+ * a few hundred milliseconds of samples to flush.  Waiting for audio ensures
+ * we never cut the old stream short.
+ */
+void vlc_stitch_try_commit(void)
+{
+    if (!core.stitch_switch_pending)
+        return;
+
+    if (vlc_audio_read_buf_fill() > 0)
+        return;   /* old audio still draining — nothing to do yet */
+
+    /* Old buffer is dry — commit both audio and video atomically. */
+    vlc_stitch_commit_audio();   /* flip audio read pointer to staging */
+    vlc_video_stitch_commit();   /* flip video read pointer to staging */
+
+    pthread_mutex_lock(&core.mutex);
+    core.stitch_switch_pending = false;
+    core.stitch_resync_pending = false;
+    pthread_mutex_unlock(&core.mutex);
+
+    fprintf(stderr, "[VLC-CORE] Stitch committed — both buffers switched.\n");
+}
+
+void vlc_stitch_cancel(void)
+{
+    pthread_mutex_lock(&core.mutex);
+    core.stitch_switch_pending = false;
+    core.stitch_resync_pending = false;
+    pthread_mutex_unlock(&core.mutex);
+    fprintf(stderr, "[VLC-CORE] Stitch cancelled.\n");
+}
+
 RETRO_API void retro_run(void)
 {
     input_poll_cb();
@@ -700,9 +797,10 @@ bool r1 = input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_R); /
 
     // Start playback on first run
     if (core.pending_play) {
-        core.pending_play = false;
-        libvlc_media_player_play(core.mp);
-        core.play_start_attempt = true;
+      
+        libvlc_media_player_play(core.mp); 
+		 core.initial_load = true;
+		core.play_start_attempt = true;
         core.play_attempt_frames = 0;
     }
 
@@ -726,12 +824,20 @@ bool r1 = input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_R); /
             if (core.mp) libvlc_media_player_stop(core.mp);
             init_menu_video_buffer();
         } else {
-            core.pending_play = true;
+            core.pending_play = false;
         }
     }
 
 
+else if (core.hard_discontinuity && core.iptv_menu_enabled && core.expect_ad_break_switch) {
+    core.expect_ad_break_switch = false;
+	core.hard_discontinuity = false;
+    fprintf(stderr, "[CORE] Discontinuity detected, reloading media: %s\n", current_channel_path);
+    switch_to_media(current_channel_path);
+	
 
+
+        }
 
     // === START = Pause/Play ===
     if (start && !prev_start) {
@@ -819,35 +925,66 @@ end_inputs:
     prev_l2     = l2;
     prev_r2     = r2;
     prev_x      = x;
+int64_t now_us = get_time_us();
+int64_t t = libvlc_media_player_get_time(core.mp);
 
-  // === VIDEO OUTPUT ===
+bool timestamp_jump = false;
+bool video_stalled = false;
+
+// --- Detect timestamp jump ---
+if (core.last_time > 0) {
+    int64_t diff = t - core.last_time;
+
+    if (diff < -1000 || diff > 2000) {
+        timestamp_jump = true;
+        fprintf(stderr, "[SYNC] Timestamp jump: %lld ms\n", diff);
+    }
+}
+core.last_time = t;
+
+// --- Detect video stall ---
+if (core.last_video_frame_time > 0) {
+    int64_t gap_ms = (now_us - core.last_video_frame_time) / 1000;
+
+    if (gap_ms > 300) {
+        video_stalled = true;
+        fprintf(stderr, "[SYNC] Video stall: %lld ms\n", gap_ms);
+    }
+}
+
+    // === VIDEO OUTPUT ===
     if (!core.menu_active) {
         const uint32_t *vbuf;
         unsigned vw, vh, vpitch;
-        if (vlc_video_get_frame(&vbuf, &vw, &vh, &vpitch))
+        if (vlc_video_get_frame(&vbuf, &vw, &vh, &vpitch)) {
+            core.last_video_frame_time = get_time_us();
+            core.video_frame_seen = true;
             video_cb(vbuf, vw, vh, vpitch);
-		 	if (vlc_video_consume_pending_release(0)) {
-     
-        vlc_audio_sync_and_enable(0);
-  
-		
-    }
+       
+        }
     } else {
         pthread_mutex_lock(&core.mutex);
         if (core.video_buffer && core.video_width && core.video_height)
             video_cb(core.video_buffer, core.video_width, core.video_height, core.video_pitch);
-       
-		pthread_mutex_unlock(&core.mutex);
+        pthread_mutex_unlock(&core.mutex);
     }
 
+    /*
+     * Dual-buffer stitch commit check.
+     * When a stitch is in flight the old read buffer is draining while the
+     * new stream fills the staging buffer.  Once the old audio buffer is
+     * empty we flip both audio and video to the staged buffer atomically.
+     */
+    if (core.stitch_switch_pending)
+        vlc_stitch_try_commit();
 
     // === AUDIO OUTPUT every frame ===
     if (audio_batch_cb) {
         static int16_t audio_frame[SAMPLES_PER_FRAME * 2];
         vlc_audio_ring_read(audio_frame, SAMPLES_PER_FRAME);
         audio_batch_cb(audio_frame, SAMPLES_PER_FRAME);
-	
     }
+
 }
 
 RETRO_API void retro_get_system_av_info(struct retro_system_av_info *info) {
