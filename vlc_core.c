@@ -82,47 +82,7 @@ static bool get_option_enabled(const char *key) {
 // The event callback function
 // The event callback function
 static void vlc_event_cb(const struct libvlc_event_t *ev, void *data) {
-    if (!core.iptv_menu_enabled)
-        return;
-
-    if (ev->type == libvlc_MediaPlayerESDeleted) {
-        pthread_mutex_lock(&core.mutex);
-
-        // 1. Time-based suppression window (absorbs the cascade of Video/Audio/Sub ESDeleted events)
-        if (core.suppress_stitch_until_us > 0 && get_time_us() < core.suppress_stitch_until_us) {
-            fprintf(stderr, "[VLC-CORE] Suppressed ESDeleted (within seek window)\n");
-            pthread_mutex_unlock(&core.mutex);
-            return;
-        }
-
-        /* Suppress the ESDeleted caused by the initial-load set_time hack */
-        if (core.initial_load || core.stitch_seek_pending) {
-            core.stitch_seek_pending = false;
-            core.initial_load = false; // Clear this so it doesn't stay true forever
-            core.stitch_resync_pending = true;
-            
-            // Activate a 1-second shield to absorb the remaining ESDeleted events
-            core.suppress_stitch_until_us = get_time_us() + 1000000; 
-
-            fprintf(stderr, "[VLC-CORE] Suppressed initial-load ESDeleted (sync hack)\n");
-            pthread_mutex_unlock(&core.mutex);
-            return;
-        }
-        
-        // Only trigger if the menu is *not active* and we're not doing a normal switch
-        if (!core.menu_active && core.expect_ad_break_switch) {
-            core.true_discontinuity_pending = true;
-            core.stitch_resync_pending      = true;
-            core.stitch_switch_pending      = true;
-
-            // 2. THE MISSING LINE: Actually reset the flag!
-            core.expect_ad_break_switch = false;
-
-            fprintf(stderr, "[VLC-CORE] Hard Discontinuity Triggered (Ad/Prog Switch)\n");
-        }
-
-        pthread_mutex_unlock(&core.mutex);
-    }
+  
 }
 
 static libvlc_media_t* create_media(const char *path,
@@ -795,14 +755,11 @@ bool r1 = input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_R); /
 
     if (!core.mp) goto end_inputs;
 
-    // Start playback on first run
-    if (core.pending_play) {
-      
-        libvlc_media_player_play(core.mp); 
-		 core.initial_load = true;
-		core.play_start_attempt = true;
-        core.play_attempt_frames = 0;
-    }
+
+    // Start playback on first run 
+	if (!core.menu_active && core.pending_play) { 
+	core.pending_play = false;
+	libvlc_media_player_play(core.mp); }
 
     // === ERROR DETECTION ===
     if (core.play_start_attempt) {
@@ -827,17 +784,6 @@ bool r1 = input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_R); /
             core.pending_play = false;
         }
     }
-
-
-else if (core.hard_discontinuity && core.iptv_menu_enabled && core.expect_ad_break_switch) {
-    core.expect_ad_break_switch = false;
-	core.hard_discontinuity = false;
-    fprintf(stderr, "[CORE] Discontinuity detected, reloading media: %s\n", current_channel_path);
-    switch_to_media(current_channel_path);
-	
-
-
-        }
 
     // === START = Pause/Play ===
     if (start && !prev_start) {
@@ -932,7 +878,7 @@ bool timestamp_jump = false;
 bool video_stalled = false;
 
 // --- Detect timestamp jump ---
-if (core.last_time > 0) {
+/*if (core.last_time > 0) {
     int64_t diff = t - core.last_time;
 
     if (diff < -1000 || diff > 2000) {
@@ -941,7 +887,7 @@ if (core.last_time > 0) {
     }
 }
 core.last_time = t;
-
+*/
 // --- Detect video stall ---
 if (core.last_video_frame_time > 0) {
     int64_t gap_ms = (now_us - core.last_video_frame_time) / 1000;
@@ -952,15 +898,15 @@ if (core.last_video_frame_time > 0) {
     }
 }
 
-    // === VIDEO OUTPUT ===
+        // === VIDEO OUTPUT ===
     if (!core.menu_active) {
         const uint32_t *vbuf;
         unsigned vw, vh, vpitch;
         if (vlc_video_get_frame(&vbuf, &vw, &vh, &vpitch)) {
+        
             core.last_video_frame_time = get_time_us();
             core.video_frame_seen = true;
             video_cb(vbuf, vw, vh, vpitch);
-       
         }
     } else {
         pthread_mutex_lock(&core.mutex);
@@ -969,22 +915,39 @@ if (core.last_video_frame_time > 0) {
         pthread_mutex_unlock(&core.mutex);
     }
 
-    /*
-     * Dual-buffer stitch commit check.
-     * When a stitch is in flight the old read buffer is draining while the
-     * new stream fills the staging buffer.  Once the old audio buffer is
-     * empty we flip both audio and video to the staged buffer atomically.
-     */
+    // Dual-buffer stitch commit
     if (core.stitch_switch_pending)
         vlc_stitch_try_commit();
 
-    // === AUDIO OUTPUT every frame ===
-    if (audio_batch_cb) {
-        static int16_t audio_frame[SAMPLES_PER_FRAME * 2];
-        vlc_audio_ring_read(audio_frame, SAMPLES_PER_FRAME);
-        audio_batch_cb(audio_frame, SAMPLES_PER_FRAME);
+  // === AUDIO OUTPUT every frame ===
+if (audio_batch_cb) {
+
+    // 🔒 SYNC GATE (THIS is the fix)
+    if (core.audio_wait_for_sync)
+    {
+        int64_t now = get_time_us();
+
+        // Still waiting → flush audio and output silence
+        if (now < core.audio_start_time_us)
+        {
+            vlc_audio_ring_reset();
+
+            static int16_t silence[SAMPLES_PER_FRAME * 2] = {0};
+            audio_batch_cb(silence, SAMPLES_PER_FRAME);
+            return;
+        }
+
+        // Sync point reached → allow audio
+        core.audio_wait_for_sync = false;
+        vlc_audio_enable();
+
+        fprintf(stderr, "[AUDIO] Sync reached — starting audio\n");
     }
 
+    static int16_t audio_frame[SAMPLES_PER_FRAME * 2];
+    vlc_audio_ring_read(audio_frame, SAMPLES_PER_FRAME);
+    audio_batch_cb(audio_frame, SAMPLES_PER_FRAME);
+}
 }
 
 RETRO_API void retro_get_system_av_info(struct retro_system_av_info *info) {

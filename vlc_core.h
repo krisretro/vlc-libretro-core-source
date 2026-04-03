@@ -52,8 +52,10 @@ bool stitch_seek_pending;
     int  play_attempt_frames;
 bool suppress_next_stitch_event;
     pthread_mutex_t mutex;
+
 int64_t suppress_stitch_until_us;
-    bool video_frame_ready;
+    bool     audio_wait_for_sync;
+int64_t  audio_start_time_us;
     bool exit_menu;
     bool menu_active;
     bool iptv_menu_enabled;
@@ -83,6 +85,7 @@ void vlc_audio_setup_callbacks(libvlc_media_player_t *mp);
 void vlc_audio_ring_read(int16_t *dst, size_t pairs);
 void vlc_audio_ring_reset(void);        /* hard reset; re-gates output until next enable */
 void vlc_audio_enable(void);            /* trim pre-roll + open gate (call on 1st video frame) */
+void vlc_audio_disable(void);
 bool vlc_audio_is_output_enabled(void);
 size_t vlc_audio_read_buf_fill(void);   /* sample pairs remaining in the active read buffer */
 void vlc_stitch_begin(void);            /* redirect audio writes to staging; old buf drains */
