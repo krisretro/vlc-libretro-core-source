@@ -160,14 +160,15 @@ libvlc_media_add_option(m, ":clock-jitter=0");
 //libvlc_media_add_option(m, ":clock-synchro=0");
 //libvlc_media_add_option(m, ":drop-late-frames");
 		//	libvlc_media_add_option(m, ":no-ts-trust-pcr");
+		
     } else if (!is_online) {
         libvlc_media_add_option(m, ":demux=avformat");
     }
 
     // --- Online options ---
     if (is_online) {
-        libvlc_media_add_option(m, ":network-caching=5000");
-        libvlc_media_add_option(m, ":live-caching=2500");
+        libvlc_media_add_option(m, ":network-caching=2000");
+        libvlc_media_add_option(m, ":live-caching=2000");
         libvlc_media_add_option(m, ":http-reconnect");
         libvlc_media_add_option(m, ":avcodec-hw=none");
      }
@@ -175,12 +176,13 @@ libvlc_media_add_option(m, ":clock-jitter=0");
     // --- DVD options ---
     if (is_dvd) 
 	{
+		core.isDVD = true;
 fprintf(stderr, "DVD MODE\n");    
         fprintf(stderr, "[VLC] DVD MIODE *****************************: %s\n", path);
 	libvlc_media_add_option(m, ":demux=dvdnav");
               
 	libvlc_media_add_option(m, ":no-dvdsub-transparency");	
-	libvlc_media_add_option(m, ":disc-caching=300");
+	libvlc_media_add_option(m, ":disc-caching=500");
 		libvlc_media_add_option(m, ":dvdnav");
         libvlc_media_add_option(m, ":no-dvdnav-menu");
         libvlc_media_add_option(m, ":no-dvdnav-mouse-events");
@@ -697,19 +699,31 @@ void vlc_stitch_try_commit(void)
     if (!core.stitch_switch_pending)
         return;
 
-    if (vlc_audio_read_buf_fill() > 0)
-        return;   /* old audio still draining — nothing to do yet */
+    size_t a_fill = vlc_audio_read_buf_fill();
+    bool video_done = vlc_video_old_buffer_drained();
 
-    /* Old buffer is dry — commit both audio and video atomically. */
-    vlc_stitch_commit_audio();   /* flip audio read pointer to staging */
-    vlc_video_stitch_commit();   /* flip video read pointer to staging */
+    fprintf(stderr,
+        "[VLC-CORE] Stitch: audio_fill=%zu video_done=%d\n",
+        a_fill, video_done ? 1 : 0);
 
+    // wait for BOTH:
+    if (a_fill > 0 || !video_done)
+        return;
+
+    fprintf(stderr, "[VLC-CORE] Buffers fully drained — committing stitch\n");
+
+    vlc_stitch_commit_audio();
+    vlc_video_stitch_commit();
+// A/V Sync Gate: Hold audio if video hasn't arrived yet
+    if (core.audio_wait_for_sync) {
+        vlc_audio_disable();
+    } else {
+        vlc_audio_enable();
+    }
     pthread_mutex_lock(&core.mutex);
     core.stitch_switch_pending = false;
     core.stitch_resync_pending = false;
     pthread_mutex_unlock(&core.mutex);
-
-    fprintf(stderr, "[VLC-CORE] Stitch committed — both buffers switched.\n");
 }
 
 void vlc_stitch_cancel(void)
@@ -918,32 +932,46 @@ if (core.last_video_frame_time > 0) {
     // Dual-buffer stitch commit
     if (core.stitch_switch_pending)
         vlc_stitch_try_commit();
+// === A/V SYNC GATE CHECK ===
+if (core.audio_wait_for_sync) {
 
-  // === AUDIO OUTPUT every frame ===
-if (audio_batch_cb) {
+    static int stable_frames = 0;
 
-    // 🔒 SYNC GATE (THIS is the fix)
-    if (core.audio_wait_for_sync)
-    {
-        int64_t now = get_time_us();
+    // Check if video is actually progressing
+    int64_t t = libvlc_media_player_get_time(core.mp);
 
-        // Still waiting → flush audio and output silence
-        if (now < core.audio_start_time_us)
-        {
-            vlc_audio_ring_reset();
+    if (core.video_frame_seen && core.last_time >= 0) {
+        int64_t diff = llabs(t - core.last_time);
 
-            static int16_t silence[SAMPLES_PER_FRAME * 2] = {0};
-            audio_batch_cb(silence, SAMPLES_PER_FRAME);
-            return;
+        // Small, consistent forward movement = stable playback
+        if (diff > 0 && diff < 100) {
+            stable_frames++;
+        } else {
+            stable_frames = 0;
         }
+    }
 
-        // Sync point reached → allow audio
+    core.last_time = t;
+
+    // Require a few stable frames before releasing audio
+    if (stable_frames >= 3) {
         core.audio_wait_for_sync = false;
         vlc_audio_enable();
 
-        fprintf(stderr, "[AUDIO] Sync reached — starting audio\n");
-    }
+        fprintf(stderr, "[SYNC] Audio released after %d stable frames\n", stable_frames);
 
+        if (core.stitch_switch_pending) {
+            vlc_video_stitch_commit();
+            vlc_stitch_commit_audio();
+            core.stitch_switch_pending = false;
+            fprintf(stderr, "[CORE] STITCH COMPLETE: Video & Audio synced.\n");
+        }
+
+        stable_frames = 0;
+    }
+}
+  // === AUDIO OUTPUT every frame ===
+if (audio_batch_cb) {
     static int16_t audio_frame[SAMPLES_PER_FRAME * 2];
     vlc_audio_ring_read(audio_frame, SAMPLES_PER_FRAME);
     audio_batch_cb(audio_frame, SAMPLES_PER_FRAME);
