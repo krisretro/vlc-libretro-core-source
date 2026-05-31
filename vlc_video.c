@@ -12,13 +12,14 @@
 #include <stdbool.h>
 #include "vlc_core.h"
 
+
 #ifdef _WIN32
 #include <windows.h>
 #else
 #include <time.h>
 #endif
 
-#define RING_SIZE 6
+#define RING_SIZE 60
 #define VIDEO_TRANSITION_GRACE_US 120000
 
 typedef struct {
@@ -28,6 +29,7 @@ typedef struct {
     unsigned pitch;
     bool ready;
     unsigned generation;
+	int64_t pts;
 } ring_frame_t;
 
 /* Dual-buffer layout */
@@ -181,6 +183,10 @@ static void display_cb(void *data, void *id)
         pthread_mutex_unlock(&ring_mtx);
         return;
     }
+  if (!core.frontend_active) {
+        pthread_mutex_unlock(&ring_mtx);
+        return;
+    }
 
     int b = video_write_buf;
     if (ring[b][slot].generation != buffer_gen[b]) {
@@ -189,17 +195,19 @@ static void display_cb(void *data, void *id)
     }
 
     if (video_state == VIDEO_STATE_DRAINING && !video_transition_seen_new) {
-        video_transition_seen_new = true;
+        
+		video_transition_seen_new = true;
         fprintf(stderr, "[VLC-VIDEO] First new video frame (gen %u)\n", buffer_gen[b]);
     }
 
     if (waiting_for_real_frame) {
         waiting_for_real_frame = false;
         pending_release = true;
+		core.stitch_switch_pending = false;
         first_frame_time_us = get_time_us();
         fprintf(stderr, "[VLC-VIDEO] First real frame of gen %u\n", expected_gen);
     }
-
+ring[b][slot].pts = (int64_t)libvlc_media_player_get_time(core.mp) * 1000; 
     ring[b][slot].width  = ring_width;
     ring[b][slot].height = ring_height;
     ring[b][slot].pitch  = ring_pitch;
@@ -235,6 +243,9 @@ void vlc_video_flush_display(void)
     video_transition_seen_new = false;
     video_transition_deadline_us = 0;
 
+    core.last_vbuf = NULL;
+    core.last_vw = core.last_vh = core.last_vpitch = 0;
+
     pthread_mutex_unlock(&ring_mtx);
 
     fprintf(stderr, "[VLC-VIDEO] Flush display: all buffers cleared\n");
@@ -247,6 +258,17 @@ void vlc_video_stitch_and_flush(void)
     /* Prevent duplicate re-arm while a transition is already active */
     if (video_state == VIDEO_STATE_DRAINING) {
         pthread_mutex_unlock(&ring_mtx);
+
+        /* BUG 3 FIX: core.video_frame_seen must only be written while
+         * holding core.mutex — this function is called from the VLC audio
+         * thread (via audio_flush) and the main thread reads the flag
+         * without any lock, so the unsynchronised write was a data race
+         * that could cause a crash during seeking.  Take the proper mutex
+         * now that ring_mtx is released. */
+        pthread_mutex_lock(&core.mutex);
+        core.video_frame_seen = false;
+        pthread_mutex_unlock(&core.mutex);
+
         fprintf(stderr, "[VLC-VIDEO] Stitch already active — ignoring duplicate arm\n");
         return;
     }
@@ -322,6 +344,24 @@ bool vlc_video_old_buffer_drained(void)
 {
     pthread_mutex_lock(&ring_mtx);
 
+    // If we aren't even stitching, we are "drained" by default
+    if (video_state != VIDEO_STATE_DRAINING) {
+        pthread_mutex_unlock(&ring_mtx);
+        return true;
+    }
+
+    // IPTV Path: We commit as soon as we see the first frame of the new stream.
+    // This prevents hanging if the previous stream stopped sending data.
+ if (core.iptv_menu_enabled) {
+        bool seen_new = video_transition_seen_new;
+        pthread_mutex_unlock(&ring_mtx);
+        /* IPTV: video is “done” once we’ve seen at least one new frame.
+           Audio drain is handled in vlc_stitch_try_commit. */
+        return seen_new;
+    }
+
+
+    /* DVD / Normal Path */
     int b = video_read_buf;
     unsigned gen = buffer_gen[b];
     size_t count = 0;
@@ -331,27 +371,15 @@ bool vlc_video_old_buffer_drained(void)
             count++;
     }
 
-    bool drained = (count == 0);
-
-    if (video_state != VIDEO_STATE_DRAINING) {
-        pthread_mutex_unlock(&ring_mtx);
-        /* No video stitch is armed.  Report ready unconditionally so the
-         * core's vlc_stitch_try_commit() can fire on the audio drain
-         * condition alone (DVD path).  The caller must not invoke
-         * vlc_video_stitch_commit() when we return true here — it is a
-         * no-op because video_state is still PLAYING. */
-        return true;
-    }
-
     int64_t now_us = get_time_us();
     bool deadline_hit = (now_us >= video_transition_deadline_us);
-
-    bool ready = (video_transition_seen_new && drained) || deadline_hit;
-
+    
+    // Ready if (we've seen new data AND old buffer is empty) OR we hit the timeout
+    bool ready = (video_transition_seen_new && count == 0) || deadline_hit;
+    
     pthread_mutex_unlock(&ring_mtx);
     return ready;
 }
-
 /* Format negotiation */
 static unsigned setup_format_cb(void **opaque, char *chroma, unsigned *width, unsigned *height,
                                 unsigned *pitches, unsigned *lines)
@@ -392,32 +420,32 @@ static unsigned setup_format_cb(void **opaque, char *chroma, unsigned *width, un
 
     bool needs_realloc = (*width > ring_alloc_width || *height > ring_alloc_height);
 
-    if (!needs_realloc) {
+if (!needs_realloc) {
         pthread_mutex_lock(&ring_mtx);
+
+        /* If we are already mid-stitch, we only want to clear the writing side.
+         * If we are NOT stitching, we clear everything to ensure no stale frames. */
+        int start_b = (video_state == VIDEO_STATE_DRAINING) ? video_write_buf : 0;
+        int end_b   = (video_state == VIDEO_STATE_DRAINING) ? video_write_buf : 1;
+
+        for (int b = start_b; b <= end_b; b++) {
+            for (int i = 0; i < RING_SIZE; i++) {
+                ring[b][i].ready = false;
+            }
+            write_slot[b] = 0;
+            read_slot[b]  = 0;
+        }
 
         if (current_gen == 0) {
             current_gen = 1;
-            expected_gen = 1;
-            waiting_for_real_frame = true;
-
-            video_write_buf = 0;
-            video_read_buf  = 0;
-
             buffer_gen[0] = 1;
-            buffer_gen[1] = 0;
-
-            write_slot[0] = write_slot[1] = 0;
-            read_slot[0]  = read_slot[1]  = 0;
-
-            fprintf(stderr, "[VLC-VIDEO] Path A initial load (gen 1).\n");
+            video_write_buf = video_read_buf = 0;
         } else {
-            current_gen++;
-            expected_gen = current_gen;
-            waiting_for_real_frame = true;
-
-            buffer_gen[video_write_buf] = current_gen;
-
-            fprintf(stderr, "[VLC-VIDEO] Path A seamless format change (gen %u).\n", current_gen);
+            // Only increment generation if we aren't already waiting for a new one
+            if (video_state != VIDEO_STATE_DRAINING) {
+                current_gen++;
+                buffer_gen[video_write_buf] = current_gen;
+            }
         }
 
         ring_width  = *width;
@@ -425,7 +453,6 @@ static unsigned setup_format_cb(void **opaque, char *chroma, unsigned *width, un
         ring_pitch  = new_pitch;
 
         pthread_mutex_unlock(&ring_mtx);
-
         *pitches = new_pitch;
         *lines   = *height;
         return 1;
@@ -447,7 +474,7 @@ static unsigned setup_format_cb(void **opaque, char *chroma, unsigned *width, un
     current_gen++;
     expected_gen = current_gen;
     waiting_for_real_frame = true;
-
+core.stitch_switch_pending = true;
     video_write_buf = 0;
     video_read_buf  = 0;
 
@@ -461,11 +488,11 @@ static unsigned setup_format_cb(void **opaque, char *chroma, unsigned *width, un
 
     *pitches = new_pitch;
     *lines   = *height;
-    return 1;
+    return 1; 
 }
 
 /* Frame access */
-bool vlc_video_get_frame(const uint32_t **buf_out, unsigned *w, unsigned *h, unsigned *pitch)
+bool vlc_video_get_frame(const uint32_t **buf_out, unsigned *w, unsigned *h, unsigned *pitch, int64_t *out_pts, int64_t target_pts)
 {
     pthread_mutex_lock(&ring_mtx);
 
@@ -473,19 +500,94 @@ bool vlc_video_get_frame(const uint32_t **buf_out, unsigned *w, unsigned *h, uns
     unsigned gen = buffer_gen[b];
     bool found = false;
 
-    for (int step = 0; step < RING_SIZE; step++) {
-        int slot = (read_slot[b] + step) % RING_SIZE;
-        if (ring[b][slot].ready && ring[b][slot].generation == gen) {
-            *buf_out = ring[b][slot].buf;
-            *w       = ring[b][slot].width;
-            *h       = ring[b][slot].height;
-            *pitch   = ring[b][slot].pitch;
+    /* Simple "due" search for IPTV/Timed mode */
+    if (target_pts > 0) {
+        bool retry = true;
+        
+        /* Check buffer fill level first */
+        size_t fill = 0;
+        for (int i = 0; i < RING_SIZE; i++) {
+            if (ring[b][i].ready && ring[b][i].generation == gen) fill++;
+        }
 
-            ring[b][slot].ready = false;
-            read_slot[b] = (slot + 1) % RING_SIZE;
+        while (retry) {
+            retry = false;
+            int oldest_slot = -1;
+            for (int i = 0; i < RING_SIZE; i++) {
+                int slot = (read_slot[b] + i) % RING_SIZE;
+                if (ring[b][slot].ready && ring[b][slot].generation == gen) {
+                    oldest_slot = slot;
+                    break;
+                }
+            }
 
-            found = true;
-            break;
+            if (oldest_slot != -1) {
+                int64_t pts = ring[b][oldest_slot].pts;
+                int64_t diff = pts - target_pts;
+
+                /* TIMEBASE SANITY: If difference is > 5s, references are likely mismatched.
+                 * Fallback to sequential to avoid permanent stall. */
+                if (llabs(diff) > 5000000) {
+                    target_pts = -1; 
+                    break;
+                }
+
+                /* If the buffer is very full (>45 frames), drop frames rapidly to catch up */
+                if (fill > 45 && diff < 0) {
+                    ring[b][oldest_slot].ready = false;
+                    read_slot[b] = (oldest_slot + 1) % RING_SIZE;
+                    fill--;
+                    retry = true;
+                    continue;
+                }
+
+                /* If frame is way too late (>200ms), drop it and try next */
+                if (diff < -200000) {
+                    ring[b][oldest_slot].ready = false;
+                    read_slot[b] = (oldest_slot + 1) % RING_SIZE;
+                    fill--;
+                    retry = true;
+                    continue;
+                }
+
+                /* DYNAMIC DUE WINDOW:
+                 * If buffer is empty, wait up to 40ms.
+                 * If buffer has > 15 frames, reduce wait to 5ms to flush backlog.
+                 * If buffer has > 35 frames, play regardless of timing (emergency flush).
+                 */
+                int64_t due_threshold = 40000;
+                if (fill > 15) due_threshold = 5000;
+                if (fill > 35) due_threshold = 1000000000; /* 1000 seconds */
+
+                if (diff < due_threshold) {
+                    *buf_out = ring[b][oldest_slot].buf;
+                    *w       = ring[b][oldest_slot].width;
+                    *h       = ring[b][oldest_slot].height;
+                    *pitch   = ring[b][oldest_slot].pitch;
+                    if (out_pts) *out_pts = ring[b][oldest_slot].pts;
+                    ring[b][oldest_slot].ready = false;
+                    read_slot[b] = (oldest_slot + 1) % RING_SIZE;
+                    found = true;
+                }
+            }
+        }
+    }
+
+    if (target_pts <= 0) {
+        /* No timing - fallback to sequential */
+        for (int step = 0; step < RING_SIZE; step++) {
+            int slot = (read_slot[b] + step) % RING_SIZE;
+            if (ring[b][slot].ready && ring[b][slot].generation == gen) {
+                *buf_out = ring[b][slot].buf;
+                *w       = ring[b][slot].width;
+                *h       = ring[b][slot].height;
+                *pitch   = ring[b][slot].pitch;
+                if (out_pts) *out_pts = ring[b][slot].pts;
+                ring[b][slot].ready = false;
+                read_slot[b] = (slot + 1) % RING_SIZE;
+                found = true;
+                break;
+            }
         }
     }
 

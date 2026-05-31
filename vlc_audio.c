@@ -20,7 +20,7 @@
 #define AUDIO_TAIL_KEEP_PAIRS_OTHER   5760
 
 #define AUDIO_TRANSITION_GRACE_US_DVD   100000
-#define AUDIO_TRANSITION_GRACE_US_OTHER  120000
+#define AUDIO_TRANSITION_GRACE_US_OTHER  500000
 
 /* ── Time helper ─────────────────────────────────────────────────────────── */
 static int64_t get_time_us(void)
@@ -68,6 +68,9 @@ static size_t audio_tail_keep_pairs = AUDIO_TAIL_KEEP_PAIRS_OTHER;
 
 /* Timing state */
 static int64_t audio_last_pts = 0;
+
+/* Current decoded audio PTS for IPTV A/V sync */
+int64_t audio_current_pts = -1;
 
 /* ── size helpers ── */
 static size_t get_ring_size(void)
@@ -152,14 +155,30 @@ static void maybe_commit_switch_locked(void)
         audio_transition_seen_new ? 1 : 0,
         near_end ? 1 : 0,
         deadline_hit ? 1 : 0);
+if (core.iptv_menu_enabled) {
+    bool near_end = (oldbuf->fill <= audio_tail_keep_pairs);
 
+    /* Only commit early if we have BOTH seen new data AND old is nearly drained.
+     * Deadline commit is the fallback if new data takes too long. */
     if ((audio_transition_seen_new && near_end) || deadline_hit) {
         audio_read_buf = audio_write_buf;
-        audio_state = AUDIO_STATE_PLAYING;
+        audio_state    = AUDIO_STATE_PLAYING;
         audio_transition_seen_new = false;
 
-        fprintf(stderr, "[VLC-AUDIO] Transition commit: reads -> buffer %d\n", audio_read_buf);
+        fprintf(stderr, "[VLC-AUDIO] IPTV commit (seen_new=%d deadline=%d)\n",
+                audio_transition_seen_new ? 1 : 0, deadline_hit ? 1 : 0);
     }
+    return;
+}
+
+/* --- DVD / normal path (UNCHANGED) --- */
+if ((audio_transition_seen_new && near_end) || deadline_hit) {
+    audio_read_buf = audio_write_buf;
+    audio_state = AUDIO_STATE_PLAYING;
+    audio_transition_seen_new = false;
+
+    fprintf(stderr, "[VLC-AUDIO] Transition commit: reads -> buffer %d\n", audio_read_buf);
+}
 }
 
 /* ── write audio ── */
@@ -202,7 +221,10 @@ static void audio_play(void *data, const void *samples, unsigned count, int64_t 
     pthread_mutex_lock(&rb_mtx);
 
     /* Track audio continuity */
-    if (audio_last_pts != 0 && llabs(pts - audio_last_pts) > 2000000) {
+    int64_t jump_threshold = 2000000;
+    if (core.iptv_menu_enabled) jump_threshold = 5000000;
+
+    if (audio_last_pts != 0 && llabs(pts - audio_last_pts) > jump_threshold) {
         fprintf(stderr, "[VLC-AUDIO] Detected PTS jump %lld us\n",
                 (long long)(pts - audio_last_pts));
 
@@ -213,7 +235,8 @@ static void audio_play(void *data, const void *samples, unsigned count, int64_t 
          * are handled via audio_flush, so we still suppress here. */
         bool suppressed = core.isDVD
                        || core.stitch_switch_pending
-                       || core.suppress_next_stitch_event;
+                       || core.suppress_next_stitch_event
+					    || core.iptv_menu_enabled;
 
         if (core.suppress_next_stitch_event) {
             core.suppress_next_stitch_event = false;
@@ -231,6 +254,8 @@ static void audio_play(void *data, const void *samples, unsigned count, int64_t 
         pthread_mutex_unlock(&core.mutex);
     }
     audio_last_pts = pts;
+    /* Use media player time instead of raw PTS to stay consistent with video.c sync logic */
+    audio_current_pts = (int64_t)libvlc_media_player_get_time(core.mp) * 1000;
 
     if (audio_state == AUDIO_STATE_DRAINING && !audio_transition_seen_new) {
         audio_transition_seen_new = true;
@@ -248,7 +273,7 @@ void vlc_audio_ring_read(int16_t *dst, size_t pairs)
 {
     pthread_mutex_lock(&rb_mtx);
 
-    if (!audio_output_enabled) {
+    if (!audio_output_enabled){
         memset(dst, 0, pairs * sizeof(int16_t) * 2);
         pthread_mutex_unlock(&rb_mtx);
         return;
@@ -275,6 +300,21 @@ void vlc_audio_ring_read(int16_t *dst, size_t pairs)
 }
 
 /* ── REQUIRED EXPORTS ── */
+int64_t vlc_audio_get_playback_pts(void)
+{
+    pthread_mutex_lock(&rb_mtx);
+    int64_t pts = audio_current_pts;
+    size_t fill = rb[audio_read_buf].fill;
+    pthread_mutex_unlock(&rb_mtx);
+
+    /* Subtract the buffer residency time to get the timestamp of the 
+     * samples currently exiting the internal ring. */
+    if (pts > 0) {
+        pts -= (int64_t)(((double)fill / AUDIO_TARGET_RATE) * 1000000.0);
+    }
+    return pts;
+}
+
 size_t vlc_audio_read_buf_fill(void)
 {
     pthread_mutex_lock(&rb_mtx);
@@ -321,8 +361,66 @@ static void audio_flush(void *data, int64_t pts)
 {
     (void)data;
     (void)pts;
+	pthread_mutex_lock(&core.mutex);
+    bool is_seek = core.stitch_seek_pending;
+    pthread_mutex_unlock(&core.mutex);
 
-    if (core.isDVD) {
+     if (is_seek) {
+    fprintf(stderr, "[VLC-AUDIO] Seek flush — resetting audio ring\n");
+    vlc_audio_ring_reset();
+    vlc_video_flush_display();
+    vlc_audio_disable();
+
+    pthread_mutex_lock(&core.mutex);
+    core.audio_wait_for_sync = true;
+    core.video_frame_seen = false;
+    /* DO NOT clear stitch_seek_pending here — VLC fires audio_flush
+     * multiple times per seek. Leave the flag up until video stabilises. */
+    pthread_mutex_unlock(&core.mutex);
+    return;
+}
+if (core.iptv_menu_enabled) {
+
+    
+pthread_mutex_lock(&core.mutex);
+    bool already = core.stitch_switch_pending;
+
+    if (!already) {
+        core.stitch_switch_pending = true;
+        core.audio_wait_for_sync = true;
+        /* BUG 4 FIX (part 2a): Clear video_frame_seen under the mutex so
+         * the IPTV sync gate in retro_run cannot prematurely release audio
+         * because the flag was still set from the previous stream segment. */
+        core.video_frame_seen = false;
+    }
+
+    pthread_mutex_unlock(&core.mutex);
+
+    if (!already) {
+
+        fprintf(stderr,
+            "[VLC-AUDIO] IPTV discontinuity → starting stitch\n");
+
+        /* Start the audio dual-buffer transition. */
+        vlc_stitch_begin();
+
+        /* BUG 4 FIX (part 2b): The original code omitted this call, so the
+         * video ring never got a staging buffer.  New video frames were
+         * written into the same buffer that was still being read, producing
+         * corrupted output and leaving audio permanently ahead of video
+         * after the stitch.  Arm the video stitch here, exactly as the
+         * DVD/normal path does. */
+        vlc_video_stitch_and_flush();
+    }
+    else {
+
+        fprintf(stderr,
+            "[VLC-AUDIO] IPTV stitch already active\n");
+    }
+
+    return;
+}else{
+  //  if (core.isDVD) {
         pthread_mutex_lock(&rb_mtx);
 
         bool already = (audio_state == AUDIO_STATE_DRAINING);
@@ -340,30 +438,13 @@ static void audio_flush(void *data, int64_t pts)
 
             vlc_stitch_begin();
 			vlc_video_stitch_and_flush();
-            /* Do NOT call vlc_video_stitch_and_flush() here.
-             *
-             * On a DVD VTS_CHANGE the audio ring can hold up to ~2 s of
-             * buffered outtro audio while the video ring only holds ~240 ms
-             * (RING_SIZE=6 at 25 fps).  If we arm the video stitch here,
-             * video writes are immediately redirected to the staging buffer
-             * and the read buffer (buf 0) empties within a few frames,
-             * causing a frozen frame for the entire audio drain period.
-             * The result is that outtro video cuts off far too early while
-             * audio plays the transition in full.
-             *
-             * For DVD, the VTS boundary is a clean editorial cut — there is
-             * no dirty pipeline residual in the video path that needs to be
-             * hidden behind a dual-buffer swap.  We let video keep writing
-             * and reading from buf 0 so the outtro continues to display
-             * uninterrupted.  vlc_video_old_buffer_drained() returns true
-             * immediately when no video stitch is armed, so the core commit
-             * fires as soon as the audio drain condition is satisfied. */
+            
         } else {
             fprintf(stderr, "[VLC-AUDIO] DVD flush ignored (already stitching)\n");
         }
 
         return;
-    }
+   }
 
     pthread_mutex_lock(&rb_mtx);
     start_transition_locked();
@@ -382,10 +463,8 @@ void vlc_audio_ring_reset(void)
 
     audio_state = AUDIO_STATE_PLAYING;
     audio_transition_seen_new = false;
-
-    audio_output_enabled = true;
+    audio_current_pts = -1;
     audio_last_pts = 0;
-
     pthread_mutex_unlock(&rb_mtx);
 
     fprintf(stderr, "[VLC-AUDIO] Ring reset (external call)\n");
