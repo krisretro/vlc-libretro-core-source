@@ -220,7 +220,8 @@ static libvlc_media_t* create_media(const char *path,
 }
 
 void vlc_reset_all_state(void)
-{
+
+
     pthread_mutex_lock(&core.mutex);
 
     core.stitch_switch_pending = false;
@@ -229,16 +230,18 @@ void vlc_reset_all_state(void)
     core.audio_wait_for_sync = false;
     core.video_frame_seen = false;
     core.true_discontinuity_pending = false;
+	 pthread_mutex_unlock(&core.mutex);
+	 
 
-    pthread_mutex_unlock(&core.mutex);
 
-    /* Reset audio + video rings */
+    {/* Reset audio + video rings */
     vlc_audio_ring_reset();
     vlc_video_flush_display();
-
-    /* Reset timing */
+   	  pthread_mutex_lock(&core.mutex);
+ /* Reset timing */
     core.last_video_frame_time = 0;
     core.last_time = -1;
+    pthread_mutex_unlock(&core.mutex);
 }
 
 bool switch_to_media(const char *path) {
@@ -304,18 +307,26 @@ bool switch_to_media(const char *path) {
     libvlc_media_player_set_media(core.mp, m);
     libvlc_media_release(m);
 
-    core.pending_play = true;
-    
+
+ pthread_mutex_lock(&core.mutex);
+   // core.pending_play = true;
+
     // === FORCE resync gate immediately (works for both initial and stitches) ===
     if (!core.iptv_menu_enabled) {
         core.audio_wait_for_sync = true;
         core.video_frame_seen = false;
-        vlc_audio_disable();
+      //  vlc_audio_disable();
     } else {
         // IPTV: let startup run free; only stitches will gate audio
         core.audio_wait_for_sync = false;
         core.video_frame_seen = false;
     }
+	 pthread_mutex_unlock(&core.mutex);
+    if (!core.iptv_menu_enabled) {
+        vlc_audio_disable();
+    }
+
+    libvlc_media_player_play(core.mp);
     return true;
 }
 
@@ -374,9 +385,15 @@ static bool load_media_file(const char *path) {
     core.pending_play = true;
     // === FORCE resync gate immediately (works for both initial and stitches) ===
     if (!core.iptv_menu_enabled) {
-        core.audio_wait_for_sync = true;
-        core.video_frame_seen = false;
-        vlc_audio_disable();
+        if (libvlc_media_player_play(core.mp) >= 0) {
+        // Force VLC to pause instantly on frame 0
+        libvlc_media_player_set_pause(core.mp, 1);
+        core.is_playing = false;
+        core.paused = true;
+    }
+    
+    core.pending_play = true; // Mark that we are waiting for the EmuVR setup window
+    core.audio_wait_for_sync = true;
     } else {
         // IPTV: let startup run free; only stitches will gate audio
         core.audio_wait_for_sync = false;
@@ -803,7 +820,33 @@ void vlc_stitch_cancel(void)
 
 RETRO_API void retro_run(void)
 {
-    static bool       scrubbing         = false;
+  // === SOLID BLANK INTERCEPT FOR EMUVR INITIALIZATION ===
+    if (core.pending_play) {
+        static int emuvr_boot_ticks = 0;
+        emuvr_boot_ticks++;
+
+        // A static 64x64 black buffer to pass to the frontend
+        static uint32_t black_placeholder[64 * 64] = {0};
+
+        if (emuvr_boot_ticks < 120) {
+            // Stream the black placeholder frame to keep RetroArch responsive
+            if (video_cb) {
+                video_cb(black_placeholder, 64, 64, 64 * 4);
+            }
+            return; // Exit early! Audio loops and timeline progressions are completely frozen
+        } else {
+            // The 2-second stabilization window has cleared. Kickstart actual playback!
+            fprintf(stderr, "[CORE] EmuVR window ready. Resuming VLC media playback stream.\n");
+            
+            libvlc_media_player_set_pause(core.mp, 0); // Unpause VLC
+            core.is_playing = true;
+            core.paused = false;
+            core.pending_play = false;
+            emuvr_boot_ticks = 0;
+        }
+    }
+
+   static bool       scrubbing         = false;
     static int64_t scrub_pos_ms      = 0;
     static int      scrub_hold_frames = 0;
 
@@ -945,6 +988,7 @@ if (core.yt_resolving) {
     if (!core.menu_active && core.pending_play) { 
         core.pending_play = false;
         libvlc_media_player_play(core.mp);
+
     }
 
     if (core.play_start_attempt) {
